@@ -1,0 +1,195 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar styles */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #4b5563;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #6b7280;
+}
+
+/* Email list styles */
+.email-list-item {
+  transition: background-color 0.15s;
+}
+
+.email-list-item:hover {
+  background-color: #f1f5f9;
+}
+
+.email-list-item.selected {
+  background-color: #dbeafe;
+}
+
+.dark .email-list-item:hover {
+  background-color: #374151;
+}
+
+.dark .email-list-item.selected {
+  background-color: #1e3a8a;
+}
+
+/* Email body styles */
+.email-body img {
+  max-width: 100%;
+  height: auto;
+}
+
+.email-body a {
+  color: #2563eb;
+}
+
+.email-body blockquote {
+  border-left: 3px solid #d1d5db;
+  padding-left: 12px;
+  margin: 8px 0;
+  color: #6b7280;
+}
+
+/* Resizer handle */
+.resizer {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background-color 0.2s;
+}
+
+.resizer:hover {
+  background-color: #2563eb;
+}
+
+.dark .resizer:hover {
+  background-color: #60a5fa;
+}
+
+/* Compose modal */
+.compose-modal .ant-modal-content {
+  overflow: hidden;
+}
+
+/* Animation */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.slide-in {
+  animation: slideIn 0.2s ease-out;
+}
+
+/* Priority indicator */
+.priority-high {
+  color: #ef4444;
+}
+
+.priority-low {
+  color: #6b7280;
+}
+
+/* Unread indicator */
+.unread-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #2563eb;
+  display: inline-block;
+}
+
+/* Tag colors (inline styles handled by Ant Design, this is for reference) */
+.tag-red { background-color: #fef2f2; color: #dc2626; border-color: #fecaca; }
+.tag-orange { background-color: #fff7ed; color: #ea580c; border-color: #fed7aa; }
+.tag-yellow { background-color: #fefce8; color: #ca8a04; border-color: #fef08a; }
+.tag-green { background-color: #f0fdf4; color: #16a34a; border-color: #bbf7d0; }
+.tag-blue { background-color: #eff6ff; color: #2563eb; border-color: #bfdbfe; }
+.tag-purple { background-color: #faf5ff; color: #9333ea; border-color: #e9d5ff; }
+.tag-pink { background-color: #fdf2f8; color: #db2777; border-color: #fbcfe8; }
+
+/* Folder tree */
+.folder-tree-item {
+  display: flex;
+  align-items: center;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.15s;
+}
+
+.folder-tree-item:hover {
+  background-color: #e2e8f0;
+}
+
+.dark .folder-tree-item:hover {
+  background-color: #374151;
+}
+
+.folder-tree-item.active {
+  background-color: #dbeafe;
+  color: #2563eb;
+}
+
+.dark .folder-tree-item.active {
+  background-color: #1e3a8a;
+  color: #93c5fd;
+}
+
+/* Attachment chip */
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.attachment-chip:hover {
+  background: #e2e8f0;
+}
