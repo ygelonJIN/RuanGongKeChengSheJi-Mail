@@ -1,0 +1,22 @@
+services:
+  maildesk:
+    build:
+      context: .
+    container_name: maildesk-dev
+    working_dir: /workspace
+    environment:
+      CI: "true"
+      DISPLAY: ${DISPLAY:-host.docker.internal:0.0}
+      ELECTRON_ENABLE_LOGGING: "true"
+    volumes:
+      - .:/workspace
+      - maildesk_node_modules:/workspace/node_modules
+      - maildesk_cache:/root/.cache
+    ports:
+      - "5173:5173"
+    tty: true
+    stdin_open: true
+
+volumes:
+  maildesk_node_modules:
+  maildesk_cache:

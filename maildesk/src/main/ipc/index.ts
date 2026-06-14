@@ -130,10 +130,17 @@ function registerIpcHandlers() {
   // ========== Folder Handlers ==========
   ipcMain.handle('folder:getAll', async (_event, accountId) => {
     const db = getDb()
+    const select = `
+      SELECT f.*,
+        COUNT(e.id) AS email_count,
+        SUM(CASE WHEN e.is_read=0 THEN 1 ELSE 0 END) AS unread_count
+      FROM folders f
+      LEFT JOIN emails e ON e.folder_id = f.id
+    `
     if (accountId) {
-      return db.prepare('SELECT * FROM folders WHERE account_id=? ORDER BY path').all(accountId)
+      return db.prepare(`${select} WHERE f.account_id=? GROUP BY f.id ORDER BY f.path`).all(accountId)
     }
-    return db.prepare('SELECT * FROM folders ORDER BY path').all()
+    return db.prepare(`${select} GROUP BY f.id ORDER BY f.path`).all()
   })
 
   ipcMain.handle('folder:subscribe', async (_event, folderId, subscribed) => {
@@ -159,11 +166,10 @@ function registerIpcHandlers() {
   })
 
   // ========== Email Handlers ==========
-  ipcMain.handle('email:getList', async (_event, params) => {
+  ipcMain.handle('email:getList', async (_event, params = {}) => {
     const db = getDb()
-    const { accountId, folderId, search, page = 1, pageSize = 50, sortField = 'date', sortOrder = 'desc' } = params
-
-    let query = `
+    const { accountId, folderId, search, page = 1, pageSize = 50, sortField = 'date', sortOrder = 'desc', view } = params as any
+    const baseSelect = `
       SELECT e.*, f.name as folder_name, f.path as folder_path,
         GROUP_CONCAT(t.id || ':' || t.name || ':' || t.color) as tags
       FROM emails e
@@ -172,43 +178,45 @@ function registerIpcHandlers() {
       LEFT JOIN tags t ON et.tag_id = t.id
       WHERE 1=1
     `
+    let query = baseSelect
     const bindings: any[] = []
+    const sortFields = ['date', 'from_email', 'subject', 'priority', 'is_starred', 'is_read', 'size']
+    const sf = sortFields.includes(sortField) ? sortField : 'date'
+    const so = sortOrder === 'asc' ? 'ASC' : 'DESC'
 
     if (accountId) {
       query += ' AND e.account_id=?'
       bindings.push(accountId)
     }
-    if (folderId) {
+
+    if (view === 'starred') {
+      query += ' AND e.is_starred=1 AND COALESCE(f.type, "") <> "trash"'
+    } else if (view === 'sent') {
+      query += ' AND (e.is_sent=1 OR f.type="sent")'
+    } else if (view === 'trash') {
+      query += ' AND f.type="trash"'
+    } else if (view === 'archive') {
+      query += ' AND COALESCE(f.type, "") NOT IN ("inbox", "sent", "trash")'
+    } else if (view === 'inbox' || !view) {
+      query += ' AND f.type="inbox"'
+    } else if (folderId) {
       query += ' AND e.folder_id=?'
       bindings.push(folderId)
     }
+
     if (search) {
       query += ' AND e.id IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)'
       bindings.push(search)
     }
 
     query += ' GROUP BY e.id'
-
-    const validSortFields = ['date', 'from_email', 'subject', 'priority', 'is_starred', 'is_read', 'size']
-    const sf = validSortFields.includes(sortField) ? sortField : 'date'
-    const so = sortOrder === 'asc' ? 'ASC' : 'DESC'
     query += ` ORDER BY e.${sf} ${so}`
-
-    const countQuery = `SELECT COUNT(*) as total FROM (${query.replace(/GROUP_CONCAT.*$/, '').replace(/LEFT JOIN folders.*$/, '').replace(/LEFT JOIN email_tags.*$/, '').replace(/LEFT JOIN tags.*$/, '')}) as count_query`
+    const countQuery = `SELECT COUNT(*) as total FROM (${query.replace(/LIMIT \? OFFSET \?$/, '')}) as count_query`
     const total = (db.prepare(countQuery).get(...bindings) as any)?.total || 0
-
     query += ' LIMIT ? OFFSET ?'
     bindings.push(pageSize, (page - 1) * pageSize)
-
     const rows = db.prepare(query).all(...bindings)
-    const emails = rows.map((row: any) => ({
-      ...row,
-      tags: row.tags ? row.tags.split(',').map((t: string) => {
-        const [id, name, color] = t.split(':')
-        return { id: parseInt(id), name, color }
-      }) : []
-    }))
-
+    const emails = rows.map((row: any) => ({ ...row, tags: row.tags ? row.tags.split(',').map((t: string) => { const [id, name, color] = t.split(':'); return { id: parseInt(id), name, color } }) : [] }))
     return { emails, total, page, pageSize }
   })
 
@@ -233,34 +241,32 @@ function registerIpcHandlers() {
   ipcMain.handle('email:getBody', async (_event, id) => {
     const db = getDb()
     let body = db.prepare('SELECT * FROM email_bodies WHERE email_id=?').get(id) as any
+    const email = db.prepare('SELECT e.*, f.path as folder_path FROM emails e LEFT JOIN folders f ON e.folder_id = f.id WHERE e.id=?').get(id) as any
+    const hasUsefulBody = !!(body?.text_plain?.trim() || body?.text_html?.trim())
+    const needsFetch = !body || !hasUsefulBody || !email?.body_fetched
 
-    if (!body) {
-      // Fetch from IMAP if not cached
-      const email = db.prepare('SELECT e.*, f.path as folder_path FROM emails e LEFT JOIN folders f ON e.folder_id = f.id WHERE e.id=?').get(id) as any
-      if (email) {
-        try {
-          const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(email.account_id) as any
-          if (account) {
-            const imap = await connectImap(account)
-            const { textHtml, textPlain } = await fetchEmailBody(imap, email.account_id, email.uid, email.folder_path || 'INBOX')
-            imap.end()
+    if (needsFetch && email) {
+      try {
+        const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(email.account_id) as any
+        if (account) {
+          const imap = await connectImap(account)
+          const { textHtml, textPlain } = await fetchEmailBody(imap, email.account_id, email.uid, email.folder_path || 'INBOX')
+          imap.end()
 
-            // Store in database
-            db.prepare('INSERT INTO email_bodies (email_id, text_html, text_plain) VALUES (?, ?, ?)')
-              .run(id, textHtml, textPlain)
+          const snippet = (textPlain || textHtml || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 150)
+          const finalHtml = textHtml || ''
+          const finalPlain = textPlain || ''
+          const hasFetchedContent = !!(finalPlain.trim() || finalHtml.trim())
 
-            // Update snippet
-            if (!email.snippet) {
-              const snippet = (textPlain || textHtml || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 150)
-              db.prepare('UPDATE emails SET snippet=? WHERE id=?').run(snippet, id)
-            }
+          db.prepare('INSERT OR REPLACE INTO email_bodies (email_id, text_html, text_plain, fetched_at) VALUES (?, ?, ?, unixepoch())')
+            .run(id, finalHtml, finalPlain)
+          db.prepare("UPDATE emails SET body_fetched=?, snippet=COALESCE(NULLIF(snippet, ''), ?) WHERE id=?").run(hasFetchedContent ? 1 : 0, snippet, id)
 
-            saveDatabase()
-            body = { email_id: id, text_html: textHtml, text_plain: textPlain }
-          }
-        } catch (err) {
-          log.error('Failed to fetch email body:', err)
+          saveDatabase()
+          body = { email_id: id, text_html: finalHtml, text_plain: finalPlain, fetched_at: Math.floor(Date.now() / 1000), body_fetched: hasFetchedContent ? 1 : 0, snippet }
         }
+      } catch (err) {
+        log.error('Failed to fetch email body:', err)
       }
     }
 
@@ -311,11 +317,13 @@ function registerIpcHandlers() {
 
   ipcMain.handle('email:move', async (_event, ids, targetFolderId) => {
     const db = getDb()
-    const stmt = db.prepare('UPDATE emails SET folder_id=? WHERE id=?')
+    const targetFolder = db.prepare('SELECT type FROM folders WHERE id=?').get(targetFolderId) as any
+    const targetType = targetFolder?.type || 'mail'
+    const stmt = db.prepare('UPDATE emails SET folder_id=?, is_sent=CASE WHEN ? = "sent" THEN 1 ELSE 0 END WHERE id=?')
     try {
       db.run('BEGIN TRANSACTION')
       for (const id of ids) {
-        stmt.run(targetFolderId, id)
+        stmt.run(targetFolderId, targetType, id)
       }
       db.run('COMMIT')
       saveDatabase()
@@ -328,11 +336,21 @@ function registerIpcHandlers() {
 
   ipcMain.handle('email:delete', async (_event, ids) => {
     const db = getDb()
-    const stmt = db.prepare('UPDATE emails SET folder_id=(SELECT id FROM folders WHERE account_id=emails.account_id AND path LIKE "%Trash%") WHERE id=?')
     try {
       db.run('BEGIN TRANSACTION')
       for (const id of ids) {
-        stmt.run(id)
+        const email = db.prepare('SELECT account_id FROM emails WHERE id=?').get(id) as any
+        if (!email) continue
+        const trashFolder = db.prepare("SELECT id FROM folders WHERE account_id=? AND type='trash' ORDER BY id LIMIT 1").get(email.account_id) as any
+        if (trashFolder?.id) {
+          db.prepare('UPDATE emails SET folder_id=?, is_sent=0 WHERE id=?').run(trashFolder.id, id)
+        } else {
+          db.prepare('DELETE FROM email_bodies WHERE email_id=?').run(id)
+          db.prepare('DELETE FROM attachments WHERE email_id=?').run(id)
+          db.prepare('DELETE FROM email_tags WHERE email_id=?').run(id)
+          db.prepare('DELETE FROM notification_history WHERE email_id=?').run(id)
+          db.prepare('DELETE FROM emails WHERE id=?').run(id)
+        }
       }
       db.run('COMMIT')
       saveDatabase()

@@ -73,6 +73,130 @@ function augmentDatabase(database: any): void {
   }
 }
 
+function rebuildMailboxStates(): void {
+  if (!db) return
+
+  const accounts = db.prepare('SELECT id FROM accounts').all() as any[]
+  for (const account of accounts) {
+    const folders = db.prepare('SELECT id, type, path FROM folders WHERE account_id=? ORDER BY id ASC').all(account.id) as any[]
+    const inboxId = folders.find((f) => f.type === 'inbox')?.id || null
+    const trashId = folders.find((f) => f.type === 'trash')?.id || null
+    const sentId = folders.find((f) => f.type === 'sent')?.id || null
+
+    const mails = db.prepare('SELECT * FROM emails WHERE account_id=? ORDER BY created_at ASC, id ASC').all(account.id) as any[]
+    for (const mail of mails) {
+      const folder = folders.find((f) => f.id === mail.folder_id)
+      const folderType = folder?.type || 'mail'
+      const starred = mail.is_starred === 1
+      const isSent = mail.is_sent === 1 || folderType === 'sent'
+      const isTrash = folderType === 'trash'
+      const isInbox = folderType === 'inbox'
+
+      const targetFolderId = isTrash ? trashId : isSent ? sentId : starred && inboxId ? inboxId : (!isTrash && !isSent && inboxId && !folder ? inboxId : null)
+      const targetIsSent = isSent ? 1 : 0
+      if (!targetFolderId || targetFolderId === mail.folder_id) continue
+
+      const collision = db.prepare('SELECT id FROM emails WHERE account_id=? AND uid=? AND folder_id=? AND id<>? LIMIT 1').get(account.id, mail.uid, targetFolderId, mail.id) as any
+      if (collision?.id) {
+        db.prepare('DELETE FROM email_bodies WHERE email_id=?').run(mail.id)
+        db.prepare('DELETE FROM attachments WHERE email_id=?').run(mail.id)
+        db.prepare('DELETE FROM email_tags WHERE email_id=?').run(mail.id)
+        db.prepare('DELETE FROM notification_history WHERE email_id=?').run(mail.id)
+        db.prepare('DELETE FROM emails WHERE id=?').run(mail.id)
+        continue
+      }
+
+      db.prepare('UPDATE emails SET folder_id=?, is_sent=? WHERE id=?').run(targetFolderId, targetIsSent, mail.id)
+    }
+  }
+}
+
+function cleanupDuplicateData(): void {
+  if (!db) return
+  const cleanupVersionKey = 'duplicate_cleanup_version'
+  const targetVersion = '3'
+  const currentVersionRow = db.prepare('SELECT value FROM settings WHERE key=?').get(cleanupVersionKey) as any
+  if (currentVersionRow?.value === targetVersion) return
+  rebuildMailboxStates()
+
+  const folders = db.prepare(`
+    SELECT account_id, remote_id, MIN(id) AS keep_id, COUNT(*) AS cnt
+    FROM folders
+    WHERE remote_id <> ''
+    GROUP BY account_id, remote_id
+    HAVING COUNT(*) > 1
+  `).all() as any[]
+
+  for (const row of folders) {
+    const dupes = db.prepare('SELECT id FROM folders WHERE account_id=? AND remote_id=? AND id <> ? ORDER BY id').all(row.account_id, row.remote_id, row.keep_id) as any[]
+    for (const dup of dupes) {
+      db.prepare('UPDATE emails SET folder_id=? WHERE folder_id=?').run(row.keep_id, dup.id)
+      db.prepare('DELETE FROM folders WHERE id=?').run(dup.id)
+    }
+  }
+
+  const emailGroups = db.prepare(`
+    SELECT account_id, folder_id, COALESCE(NULLIF(message_id,''), '') AS message_key, uid, MIN(id) AS keep_id, COUNT(*) AS cnt
+    FROM emails
+    GROUP BY account_id, folder_id, message_key, uid
+    HAVING COUNT(*) > 1
+  `).all() as any[]
+
+  for (const row of emailGroups) {
+    const dupes = db.prepare(`
+      SELECT id FROM emails
+      WHERE account_id=? AND folder_id=? AND uid=? AND COALESCE(NULLIF(message_id,''), '')=? AND id <> ?
+      ORDER BY created_at DESC, id DESC
+    `).all(row.account_id, row.folder_id, row.uid, row.message_key, row.keep_id) as any[]
+
+    for (const dup of dupes) {
+      db.prepare('DELETE FROM email_bodies WHERE email_id=?').run(dup.id)
+      db.prepare('DELETE FROM attachments WHERE email_id=?').run(dup.id)
+      db.prepare('DELETE FROM email_tags WHERE email_id=?').run(dup.id)
+      db.prepare('DELETE FROM notification_history WHERE email_id=?').run(dup.id)
+      db.prepare('DELETE FROM emails WHERE id=?').run(dup.id)
+    }
+  }
+
+  const finalMerges = db.prepare(`
+    SELECT account_id,
+           COALESCE(NULLIF(message_id,''), '') AS message_key,
+           uid,
+           COALESCE(NULLIF(subject,''), '') AS subject_key,
+           COALESCE(date / 86400, 0) AS day_key,
+           MIN(CASE WHEN folder_id IN (SELECT id FROM folders WHERE type='inbox') THEN id ELSE 9223372036854775807 END) AS inbox_keep_id,
+           MIN(id) AS absolute_keep_id,
+           COUNT(*) AS cnt
+    FROM emails
+    GROUP BY account_id, message_key, uid, subject_key, day_key
+    HAVING COUNT(*) > 1
+  `).all() as any[]
+
+  for (const row of finalMerges) {
+    const dupes = db.prepare(`
+      SELECT id, folder_id, is_starred, is_read, is_sent, created_at FROM emails
+      WHERE account_id=?
+        AND COALESCE(NULLIF(message_id,''), '')=?
+        AND uid=?
+        AND COALESCE(NULLIF(subject,''), '')=?
+        AND COALESCE(date / 86400, 0)=?
+        AND id <> ?
+      ORDER BY (CASE WHEN folder_id IN (SELECT id FROM folders WHERE type='inbox') THEN 0 ELSE 1 END), is_read ASC, is_starred DESC, is_sent DESC, created_at ASC, id ASC
+    `).all(row.account_id, row.message_key, row.uid, row.subject_key, row.day_key, row.absolute_keep_id) as any[]
+
+    for (const dup of dupes) {
+      db.prepare('DELETE FROM email_bodies WHERE email_id=?').run(dup.id)
+      db.prepare('DELETE FROM attachments WHERE email_id=?').run(dup.id)
+      db.prepare('DELETE FROM email_tags WHERE email_id=?').run(dup.id)
+      db.prepare('DELETE FROM notification_history WHERE email_id=?').run(dup.id)
+      db.prepare('DELETE FROM emails WHERE id=?').run(dup.id)
+    }
+  }
+
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(cleanupVersionKey, targetVersion)
+  log.info('Duplicate cleanup complete')
+}
+
 export async function initDatabase(): Promise<void> {
   const userDataPath = app.getPath('userData')
   dbPath = path.join(userDataPath, 'maildesk.db')
@@ -91,6 +215,7 @@ export async function initDatabase(): Promise<void> {
 
   augmentDatabase(db)
   runMigrations()
+  cleanupDuplicateData()
   insertDefaultSettings()
   saveDatabase()
 }
@@ -302,19 +427,24 @@ function runMigrations(): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_email_tags_email ON email_tags(email_id)`)
   db.run(`CREATE INDEX IF NOT EXISTS idx_email_tags_tag ON email_tags(tag_id)`)
 
-  // FTS5 virtual table for full-text search
-  db.run(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
-      subject, from_email, snippet,
-      content='emails',
-      content_rowid='id'
-    )
-  `)
+  // Full-text search is optional because sql.js builds may not include FTS5.
+  try {
+    db.run(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(
+        subject, from_email, snippet,
+        content='emails',
+        content_rowid='id'
+      )
+    `)
 
-  // Trigger to keep FTS in sync with emails table
-  db.run(`CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN INSERT INTO emails_fts(rowid, subject, from_email, snippet) VALUES (new.id, new.subject, new.from_email, new.snippet); END`)
-  db.run(`CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN INSERT INTO emails_fts(emails_fts, rowid, subject, from_email, snippet) VALUES('delete', old.id, old.subject, old.from_email, old.snippet); END`)
-  db.run(`CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN INSERT INTO emails_fts(emails_fts, rowid, subject, from_email, snippet) VALUES('delete', old.id, old.subject, old.from_email, old.snippet); INSERT INTO emails_fts(rowid, subject, from_email, snippet) VALUES (new.id, new.subject, new.from_email, new.snippet); END`)
+    // Trigger to keep FTS in sync with emails table
+    db.run(`CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN INSERT INTO emails_fts(rowid, subject, from_email, snippet) VALUES (new.id, new.subject, new.from_email, new.snippet); END`)
+    db.run(`CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN INSERT INTO emails_fts(emails_fts, rowid, subject, from_email, snippet) VALUES('delete', old.id, old.subject, old.from_email, old.snippet); END`)
+    db.run(`CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN INSERT INTO emails_fts(emails_fts, rowid, subject, from_email, snippet) VALUES('delete', old.id, old.subject, old.from_email, old.snippet); INSERT INTO emails_fts(rowid, subject, from_email, snippet) VALUES (new.id, new.subject, new.from_email, new.snippet); END`)
+    log.info('FTS5 enabled for email search')
+  } catch (err) {
+    log.warn('FTS5 unavailable in this sql.js build; continuing without full-text search', err)
+  }
 
   log.info('Database migrations complete')
 }

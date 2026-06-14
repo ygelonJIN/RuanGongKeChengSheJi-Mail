@@ -1,345 +1,112 @@
-import React, { useEffect, useState, useCallback } from 'react'
-import { Layout } from 'antd'
-import { useAppStore } from './stores/appStore'
-import Sidebar from './components/Sidebar'
+import { useCallback, useEffect, useState } from 'react'
+import { App as AntApp, Badge, Button, ConfigProvider, FloatButton, Input, Layout, Space, Typography, message, theme } from 'antd'
+import { BellOutlined, DashboardOutlined, MailOutlined, PlusOutlined, SearchOutlined, SettingOutlined } from '@ant-design/icons'
 import EmailList from './components/EmailList'
 import EmailPreview from './components/EmailPreview'
+import Sidebar from './components/Sidebar'
 import Compose from './components/Compose'
 import SettingsModal from './components/SettingsModal'
-import AccountModal from './components/AccountModal'
 import RuleModal from './components/RuleModal'
+import AccountModal from './components/AccountModal'
 import StatsPage from './components/StatsPage'
-import type { Theme } from '@preload/index'
+import { useAppStore } from './stores/appStore'
 
-const { Sider, Content } = Layout
+const { Header, Content } = Layout
+const { Title } = Typography
 
-function App() {
-  const {
-    sidebarVisible, setSidebarVisible,
-    previewVisible, setPreviewVisible,
-    sidebarWidth, setSidebarWidth,
-    setTheme, setSettings, setAccounts, setFolders, setRules, setTags,
-    composeVisible, setComposeVisible,
-    replyToEmail, setReplyToEmail,
-    selectedFolderId, setSelectedFolderId,
-    setEmails, setTotalEmails, setEmailListLoading,
-    setSelectedEmailId,
-  } = useAppStore()
+export default function App() {
+  const [composeOpen, setComposeOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [ruleOpen, setRuleOpen] = useState(false)
+  const [accountOpen, setAccountOpen] = useState(false)
+  const [accountMode, setAccountMode] = useState<'add' | 'edit'>('add')
+  const [activeView, setActiveView] = useState<'mail' | 'stats'>('mail')
+  const [search, setSearch] = useState('')
+  const { accounts, setAccounts, setFolders, setEmails, setRules, setStats, setSettings, selectedAccountId, selectedFolderId, folderView, setSelectedAccountId, setSelectedFolderId } = useAppStore()
 
-  const [currentView, setCurrentView] = useState<'mail' | 'stats'>('mail')
-  const [settingsModalOpen, setSettingsModalOpen] = useState(false)
-  const [accountModalOpen, setAccountModalOpen] = useState(false)
-  const [accountModalMode, setAccountModalMode] = useState<'add' | 'edit'>('add')
-  const [editingAccountId, setEditingAccountId] = useState<number | null>(null)
-  const [ruleModalOpen, setRuleModalOpen] = useState(false)
-  const [editingRuleId, setEditingRuleId] = useState<number | null>(null)
+  const loadData = useCallback(async () => {
+    const api = window.electronAPI
+    if (!api) return
+    const [accountsData, folders, emailResult, rules, dashboard, settings] = await Promise.all([
+      api.account.getAll(),
+      api.folder.getAll(selectedAccountId ?? undefined),
+      api.email.getList({ pageSize: 30, accountId: selectedAccountId ?? undefined, folderId: typeof selectedFolderId === 'number' ? selectedFolderId : undefined }),
+      api.rule.getAll(),
+      api.stats.getDashboard(),
+      api.settings.get(),
+    ])
+    setAccounts(accountsData || [])
+    setFolders(folders || [])
+    setEmails(emailResult?.emails || [])
+    setRules(rules || [])
+    setStats(dashboard || { totalEmails: 0, unreadEmails: 0, totalAccounts: 0, totalRules: 0 })
+    setSettings(settings || {})
+    if (!selectedAccountId && accountsData?.[0]?.id) setSelectedAccountId(accountsData[0].id)
+    if (selectedFolderId == null) setSelectedFolderId(null)
+    return { accountsData, folders, emailResult, dashboard }
+  }, [selectedAccountId, selectedFolderId, setAccounts, setFolders, setEmails, setRules, setStats, setSettings, setSelectedAccountId, setSelectedFolderId])
 
-  // Initialize app
+  useEffect(() => { document.title = 'MailDesk'; loadData().catch(() => message.warning('真实数据加载失败，已保留本地界面预览')) }, [loadData])
+
   useEffect(() => {
-    const init = async () => {
-      try {
-        const [settings, accounts, folders, rules, tags, savedTheme] = await Promise.all([
-          window.electronAPI.settings.get(),
-          window.electronAPI.account.getAll(),
-          window.electronAPI.folder.getAll(),
-          window.electronAPI.rule.getAll(),
-          window.electronAPI.tag.getAll(),
-          window.electronAPI.settings.getTheme(),
-        ])
+    if (!window.electronAPI) return
+    const offComplete = window.electronAPI.on('account:sync-complete', () => { loadData().catch(() => {}); message.success('同步完成，已刷新数据') })
+    const offError = window.electronAPI.on('account:sync-error', (payload: any) => { const error = typeof payload === 'object' && payload?.error ? payload.error : '同步失败'; message.error(`同步失败：${error}`) })
+    return () => { offComplete?.(); offError?.() }
+  }, [loadData])
 
-        setSettings(settings)
-        setAccounts(accounts)
-        setFolders(folders)
-        setRules(rules)
-        setTags(tags)
+  const openAccountConfig = (mode: 'add' | 'edit') => { setAccountMode(mode); setAccountOpen(true) }
 
-        const themeMode = savedTheme === 'system'
-          ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
-          : savedTheme as 'light' | 'dark'
-        setTheme(themeMode)
-        document.documentElement.classList.toggle('dark', themeMode === 'dark')
-
-        if (accounts.length > 0) {
-          const inboxFolder = folders.find(
-            (f: any) => f.account_id === accounts[0].id && f.type === 'inbox'
-          )
-          if (inboxFolder) {
-            setSelectedFolderId(inboxFolder.id)
-          }
-          try {
-            await window.electronAPI.account.syncAll()
-            const [folders2] = await Promise.all([window.electronAPI.folder.getAll()])
-            setFolders(folders2)
-          } catch (err) {
-            console.error('Initial sync failed:', err)
-          }
-        }
-      } catch (err) {
-        console.error('Failed to initialize app:', err)
-      }
-    }
-
-    init()
-  }, [])
-
-  // Listen for menu events
-  useEffect(() => {
-    const cleanups: (() => void)[] = []
-
-    cleanups.push(window.electronAPI.on('menu:new-email', () => {
-      setReplyToEmail(null)
-      setComposeVisible(true)
-    }))
-
-    cleanups.push(window.electronAPI.on('menu:add-account', () => {
-      setAccountModalMode('add')
-      setEditingAccountId(null)
-      setAccountModalOpen(true)
-    }))
-
-    cleanups.push(window.electronAPI.on('menu:account-settings', () => {
-      setSettingsModalOpen(true)
-    }))
-
-    cleanups.push(window.electronAPI.on('menu:sync-all', async () => {
-      await window.electronAPI.account.syncAll()
-    }))
-
-    cleanups.push(window.electronAPI.on('account:sync-complete', async (data: any) => {
-      const folders = await window.electronAPI.folder.getAll()
-      setFolders(folders)
-      if (selectedFolderId) {
-        try {
-          const result = await window.electronAPI.email.getList({ folderId: selectedFolderId, pageSize: 50 })
-          setEmails(result.emails)
-          setTotalEmails(result.total)
-        } catch {}
-      }
-    }))
-
-    cleanups.push(window.electronAPI.on('menu:about', () => {
-      setSettingsModalOpen(true)
-    }))
-
-    cleanups.push(window.electronAPI.on('toggle-sidebar', () => {
-      setSidebarVisible(!sidebarVisible)
-    }))
-
-    cleanups.push(window.electronAPI.on('toggle-preview', () => {
-      setPreviewVisible(!previewVisible)
-    }))
-
-    cleanups.push(window.electronAPI.on('theme:changed', (_theme: string) => {
-      setTheme(_theme as 'light' | 'dark')
-      document.documentElement.classList.toggle('dark', _theme === 'dark')
-    }))
-
-    cleanups.push(window.electronAPI.on('navigate', (payload: any) => {
-      if (typeof payload === 'string') {
-        setCurrentView(payload === 'stats' ? 'stats' : 'mail')
-      } else if (payload?.type === 'email') {
-        setSelectedEmailId(payload.id)
-      }
-    }))
-
-    cleanups.push(window.electronAPI.on('notification:clicked', (emailId: number) => {
-      setSelectedEmailId(emailId)
-    }))
-
-    return () => {
-      cleanups.forEach((cleanup) => cleanup())
-    }
-  }, [sidebarVisible])
-
-  // Load emails when folder changes
-  const loadEmails = useCallback(async () => {
-    if (!selectedFolderId) return
-    setEmailListLoading(true)
+  const syncAndReload = async () => {
     try {
-      const result = await window.electronAPI.email.getList({ folderId: selectedFolderId, pageSize: 50 })
-      setEmails(result.emails)
-      setTotalEmails(result.total)
-    } catch (err) {
-      console.error('Failed to load emails:', err)
-    } finally {
-      setEmailListLoading(false)
+      if (selectedAccountId) await window.electronAPI?.account.sync(selectedAccountId)
+      else await window.electronAPI?.account.syncAll()
+      await loadData()
+      message.success('同步完成')
+    } catch {
+      message.warning('同步可能未完成，请检查账户配置或服务器参数')
+      await loadData().catch(() => {})
     }
-  }, [selectedFolderId])
-
-  useEffect(() => {
-    if (selectedFolderId && currentView === 'mail') {
-      loadEmails()
-    }
-  }, [selectedFolderId, loadEmails, currentView])
-
-  // Keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey) {
-        switch (e.key) {
-          case 'n':
-            e.preventDefault()
-            setReplyToEmail(null)
-            setComposeVisible(true)
-            break
-          case 'b':
-            e.preventDefault()
-            setSidebarVisible(!sidebarVisible)
-            break
-          case ',':
-            e.preventDefault()
-            setSettingsModalOpen(true)
-            break
-        }
-      }
-      if (e.key === 'Escape') {
-        setComposeVisible(false)
-        setSettingsModalOpen(false)
-        setAccountModalOpen(false)
-        setRuleModalOpen(false)
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [sidebarVisible])
-
-  const handleResizerDrag = useCallback((e: React.MouseEvent) => {
-    e.preventDefault()
-    const startX = e.clientX
-    const startWidth = sidebarWidth
-
-    const handleMouseMove = (moveEvent: MouseEvent) => {
-      const delta = moveEvent.clientX - startX
-      const newWidth = Math.max(150, Math.min(400, startWidth + delta))
-      setSidebarWidth(newWidth)
-    }
-
-    const handleMouseUp = () => {
-      document.removeEventListener('mousemove', handleMouseMove)
-      document.removeEventListener('mouseup', handleMouseUp)
-    }
-
-    document.addEventListener('mousemove', handleMouseMove)
-    document.addEventListener('mouseup', handleMouseUp)
-  }, [sidebarWidth])
-
-  const handleAccountModalOpen = () => {
-    setAccountModalMode('add')
-    setEditingAccountId(null)
-    setAccountModalOpen(true)
   }
 
   return (
-    <Layout className="h-screen overflow-hidden">
-      <Layout>
-        {sidebarVisible && currentView === 'mail' && (
-          <>
-            <Sider
-              width={sidebarWidth}
-              style={{
-                background: 'var(--ant-color-bg-container)',
-                borderRight: '1px solid var(--ant-color-border-secondary)',
-                overflow: 'auto',
-                height: '100vh',
-              }}
-            >
-              <Sidebar
-                onAddAccount={handleAccountModalOpen}
-                onEditAccount={(accountId) => {
-                  setEditingAccountId(accountId)
-                  setAccountModalMode('edit')
-                  setAccountModalOpen(true)
-                }}
-                onOpenSettings={() => setSettingsModalOpen(true)}
-                onOpenStats={() => setCurrentView('stats')}
-                onOpenRules={() => { setEditingRuleId(null); setRuleModalOpen(true) }}
-              />
-            </Sider>
-            <div
-              className="resizer"
-              onMouseDown={handleResizerDrag}
-            />
-          </>
-        )}
+    <ConfigProvider theme={{ algorithm: theme.defaultAlgorithm, token: { colorPrimary: '#5b7cfa', borderRadius: 18 } }}>
+      <AntApp>
+        <Layout className="app-shell">
+          <Layout className="app-frame panel-surface">
+            <Header className="app-topbar">
+              <Space size={14} align="center"><div className="app-brand-copy"><Title level={4} style={{ margin: 0, color: 'var(--text-primary)' }}>MailDesk</Title></div></Space>
+              <Space size={12} wrap>
+                <Input value={search} onChange={(e) => setSearch(e.target.value)} allowClear placeholder="搜索邮件、联系人、标签" prefix={<SearchOutlined />} style={{ width: 260, borderRadius: 999 }} />
+                <Button icon={<PlusOutlined />} type="primary" onClick={() => setComposeOpen(true)}>写邮件</Button>
+                <Button icon={<SettingOutlined />} onClick={() => setSettingsOpen(true)}>设置</Button>
+                <Badge count={3} size="small"><Button icon={<BellOutlined />} aria-label="通知" /></Badge>
+              </Space>
+            </Header>
 
-        <Content style={{ display: 'flex', overflow: 'hidden', height: '100vh' }}>
-          {currentView === 'mail' ? (
-            <>
-              <div style={{ width: previewVisible ? '35%' : '100%', minWidth: 280, display: 'flex', flexDirection: 'column', borderRight: previewVisible ? '1px solid var(--ant-color-border-secondary)' : 'none' }}>
-                <EmailList onRefresh={loadEmails} />
-              </div>
-              {previewVisible && (
-                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 400 }}>
-                  <EmailPreview />
+            <Layout className="dashboard-grid">
+              <Sidebar onConfigureAccount={() => openAccountConfig(accounts.length ? 'edit' : 'add')} />
+              <Content className="content-area">
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                  <Space>
+                    <Button type={activeView === 'mail' ? 'primary' : 'default'} icon={<MailOutlined />} onClick={() => setActiveView('mail')}>邮件</Button>
+                    <Button type={activeView === 'stats' ? 'primary' : 'default'} icon={<DashboardOutlined />} onClick={() => setActiveView('stats')}>统计</Button>
+                    <Button onClick={syncAndReload}>同步并刷新</Button>
+                  </Space>
+                  <Space><Button icon={<DashboardOutlined />} onClick={() => setRuleOpen(true)}>规则</Button></Space>
                 </div>
-              )}
-            </>
-          ) : (
-            <StatsPage onBack={() => setCurrentView('mail')} />
-          )}
-        </Content>
-      </Layout>
+                {activeView === 'mail' ? <div className={`mail-layout view-${folderView}`}><EmailList /><EmailPreview /></div> : <StatsPage />}
+              </Content>
+            </Layout>
+          </Layout>
 
-      {composeVisible && (
-        <Compose
-          onClose={() => { setComposeVisible(false); setReplyToEmail(null) }}
-          replyTo={replyToEmail}
-        />
-      )}
-
-      <SettingsModal
-        open={settingsModalOpen}
-        onClose={() => setSettingsModalOpen(false)}
-      />
-
-      <AccountModal
-        open={accountModalOpen}
-        mode={accountModalMode}
-        accountId={editingAccountId}
-        onClose={() => setAccountModalOpen(false)}
-        onDeleted={async () => {
-          const accounts = await window.electronAPI.account.getAll()
-          const folders = await window.electronAPI.folder.getAll()
-          setAccounts(accounts)
-          setFolders(folders)
-          setSelectedFolderId(null)
-          setSelectedEmailId(null)
-        }}
-        onSaved={async () => {
-          const accounts = await window.electronAPI.account.getAll()
-          const folders = await window.electronAPI.folder.getAll()
-          setAccounts(accounts)
-          setFolders(folders)
-          if (accounts.length > 0) {
-            const inboxFolder = folders.find(
-              (f: any) => f.account_id === accounts[accounts.length - 1].id && f.type === 'inbox'
-            )
-            if (inboxFolder) {
-              setSelectedFolderId(inboxFolder.id)
-            }
-            try {
-              await window.electronAPI.account.sync(accounts[accounts.length - 1].id)
-              const folders2 = await window.electronAPI.folder.getAll()
-              setFolders(folders2)
-            } catch (err) {
-              console.error('Sync after add failed:', err)
-            }
-          }
-        }}
-      />
-
-      <RuleModal
-        open={ruleModalOpen}
-        ruleId={editingRuleId}
-        onClose={() => setRuleModalOpen(false)}
-        onSaved={async () => {
-          const rules = await window.electronAPI.rule.getAll()
-          setRules(rules)
-        }}
-      />
-    </Layout>
+          <FloatButton.Group trigger="hover" type="primary" style={{ right: 24, bottom: 24 }}><FloatButton icon={<DashboardOutlined />} tooltip="规则" onClick={() => setRuleOpen(true)} /></FloatButton.Group>
+          <Compose open={composeOpen} onClose={() => setComposeOpen(false)} />
+          <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+          <RuleModal open={ruleOpen} onClose={() => setRuleOpen(false)} />
+          <AccountModal open={accountOpen} mode={accountMode} accountId={accounts[0]?.id ?? null} onClose={() => setAccountOpen(false)} onSaved={() => { setAccountOpen(false); syncAndReload().catch(() => {}) }} onDeleted={() => { setAccountOpen(false); syncAndReload().catch(() => {}) }} />
+        </Layout>
+      </AntApp>
+    </ConfigProvider>
   )
 }
-
-export default App

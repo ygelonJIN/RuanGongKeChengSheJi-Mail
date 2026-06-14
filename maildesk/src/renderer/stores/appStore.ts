@@ -1,149 +1,59 @@
 import { create } from 'zustand'
-import type { Account, Folder, Email, Rule, Tag, Settings, Stats } from '../types'
 
-interface AppState {
-  // Accounts
-  accounts: Account[]
-  setAccounts: (accounts: Account[]) => void
-
-  // Folders
-  folders: Folder[]
-  setFolders: (folders: Folder[]) => void
-  getFoldersByAccount: (accountId: number) => Folder[]
-
-  // Selected state
+export interface AppState {
+  accounts: any[]
+  folders: any[]
+  emails: any[]
+  rules: any[]
+  stats: { totalEmails: number; unreadEmails: number; totalAccounts: number; totalRules: number }
+  settings: Record<string, any>
   selectedAccountId: number | null
-  setSelectedAccountId: (id: number | null) => void
-  selectedFolderId: number | null
-  setSelectedFolderId: (id: number | null) => void
+  selectedFolderId: string | number | null
+  folderView: 'inbox' | 'starred' | 'sent' | 'archive' | 'trash' | 'all'
+  setFolderView: (v: AppState['folderView']) => void
   selectedEmailId: number | null
-  setSelectedEmailId: (id: number | null) => void
-
-  // Email list
-  emails: Email[]
-  setEmails: (emails: Email[]) => void
-  totalEmails: number
-  setTotalEmails: (total: number) => void
-
-  // Email loading
-  emailListLoading: boolean
-  setEmailListLoading: (loading: boolean) => void
-  emailBody: any
-  setEmailBody: (body: any) => void
-
-  // Rules
-  rules: Rule[]
-  setRules: (rules: Rule[]) => void
-
-  // Tags
-  tags: Tag[]
-  setTags: (tags: Tag[]) => void
-
-  // Settings
-  settings: Partial<Settings>
-  setSettings: (settings: Partial<Settings>) => void
-
-  // Stats
-  stats: Stats
-  setStats: (stats: Stats) => void
-
-  // UI state
-  sidebarVisible: boolean
-  setSidebarVisible: (visible: boolean) => void
-  previewVisible: boolean
-  setPreviewVisible: (visible: boolean) => void
-  sidebarWidth: number
-  setSidebarWidth: (width: number) => void
-
-  // Theme
-  theme: 'light' | 'dark'
-  setTheme: (theme: 'light' | 'dark') => void
-
-  // Sync state
-  syncingAccounts: Set<number>
-  setSyncing: (accountId: number, syncing: boolean) => void
-
-  // Compose
-  composeVisible: boolean
-  setComposeVisible: (visible: boolean) => void
-  replyToEmail: Email | null
-  setReplyToEmail: (email: Email | null) => void
+  emailBody: any | null
+  debug: { bodyRawBytes: number; bodySubject: string; bodyHtmlLength: number; bodyTextLength: number; bodyParts: number }
+  mailChangeTick: number
+  bumpMailChangeTick: () => void
+  setAccounts: (v: any[]) => void
+  setFolders: (v: any[]) => void
+  setEmails: (v: any[]) => void
+  setRules: (v: any[]) => void
+  setStats: (v: any) => void
+  setSettings: (v: Record<string, any>) => void
+  setSelectedAccountId: (v: number | null) => void
+  setSelectedFolderId: (v: string | number | null) => void
+  setSelectedEmailId: (v: number | null) => void
+  setEmailBody: (v: any | null) => void
+  setDebug: (v: Partial<AppState['debug']>) => void
 }
 
-export const useAppStore = create<AppState>((set, get) => ({
-  // Accounts
+export const useAppStore = create<AppState>((set) => ({
   accounts: [],
-  setAccounts: (accounts) => set({ accounts }),
-
-  // Folders
   folders: [],
-  setFolders: (folders) => set({ folders }),
-  getFoldersByAccount: (accountId) => get().folders.filter((f) => f.account_id === accountId),
-
-  // Selected state
-  selectedAccountId: null,
-  setSelectedAccountId: (id) => set({ selectedAccountId: id }),
-  selectedFolderId: null,
-  setSelectedFolderId: (id) => set({ selectedFolderId: id }),
-  selectedEmailId: null,
-  setSelectedEmailId: (id) => set({ selectedEmailId: id }),
-
-  // Email list
   emails: [],
-  setEmails: (emails) => set({ emails }),
-  totalEmails: 0,
-  setTotalEmails: (total) => set({ totalEmails: total }),
-
-  // Email loading
-  emailListLoading: false,
-  setEmailListLoading: (loading) => set({ emailListLoading: loading }),
-  emailBody: null,
-  setEmailBody: (body) => set({ emailBody: body }),
-
-  // Rules
   rules: [],
-  setRules: (rules) => set({ rules }),
-
-  // Tags
-  tags: [],
-  setTags: (tags) => set({ tags }),
-
-  // Settings
-  settings: {},
-  setSettings: (settings) => set({ settings }),
-
-  // Stats
   stats: { totalEmails: 0, unreadEmails: 0, totalAccounts: 0, totalRules: 0 },
-  setStats: (stats) => set({ stats }),
-
-  // UI state
-  sidebarVisible: true,
-  setSidebarVisible: (visible) => set({ sidebarVisible: visible }),
-  previewVisible: true,
-  setPreviewVisible: (visible) => set({ previewVisible: visible }),
-  sidebarWidth: 220,
-  setSidebarWidth: (width) => set({ sidebarWidth: width }),
-
-  // Theme
-  theme: 'light',
-  setTheme: (theme) => set({ theme }),
-
-  // Sync state
-  syncingAccounts: new Set(),
-  setSyncing: (accountId, syncing) =>
-    set((state) => {
-      const newSet = new Set(state.syncingAccounts)
-      if (syncing) {
-        newSet.add(accountId)
-      } else {
-        newSet.delete(accountId)
-      }
-      return { syncingAccounts: newSet }
-    }),
-
-  // Compose
-  composeVisible: false,
-  setComposeVisible: (visible) => set({ composeVisible: visible }),
-  replyToEmail: null,
-  setReplyToEmail: (email) => set({ replyToEmail: email }),
+  settings: {},
+  selectedAccountId: null,
+  selectedFolderId: null,
+  folderView: 'inbox',
+  selectedEmailId: null,
+  emailBody: null,
+  debug: { bodyRawBytes: 0, bodySubject: '', bodyHtmlLength: 0, bodyTextLength: 0, bodyParts: 0 },
+  mailChangeTick: 0,
+  bumpMailChangeTick: () => set((s) => ({ mailChangeTick: s.mailChangeTick + 1 })),
+  setAccounts: (v) => set({ accounts: v }),
+  setFolders: (v) => set({ folders: v }),
+  setEmails: (v) => set({ emails: v }),
+  setRules: (v) => set({ rules: v }),
+  setStats: (v) => set({ stats: v }),
+  setSettings: (v) => set({ settings: v }),
+  setSelectedAccountId: (v) => set({ selectedAccountId: v }),
+  setSelectedFolderId: (v) => set({ selectedFolderId: v }),
+  setFolderView: (v) => set({ folderView: v }),
+  setSelectedEmailId: (v) => set({ selectedEmailId: v }),
+  setEmailBody: (v) => set({ emailBody: v }),
+  setDebug: (v) => set((s) => ({ debug: { ...s.debug, ...v } })),
 }))

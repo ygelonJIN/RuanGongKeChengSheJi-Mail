@@ -1,344 +1,216 @@
-import React, { useEffect, useState, useCallback } from 'react'
-import { Button, Spin, Dropdown, Tooltip, message, Tabs, Modal, Space, Divider } from 'antd'
-import {
-  RetweetOutlined, SwapLeftOutlined, ForwardOutlined,
-  DeleteOutlined, StarOutlined, StarFilled, PrinterOutlined,
-  DownOutlined, MoreOutlined, TagOutlined, MailOutlined,
-  DownloadOutlined, RollbackOutlined, ExclamationCircleOutlined,
-} from '@ant-design/icons'
-import DOMPurify from 'dompurify'
+import { useEffect, useMemo, useState } from 'react'
+import { Button, Card, Empty, Space, Tag, Typography, message, Segmented, Drawer } from 'antd'
+import { CompassOutlined, StarFilled, StarOutlined, DeleteOutlined, MailOutlined, DownloadOutlined } from '@ant-design/icons'
 import { useAppStore } from '../stores/appStore'
-import type { Email, EmailBody, Attachment } from '../types'
+import { refreshMailList } from '../utils/mailRefresh'
+
+const { Title, Text, Paragraph } = Typography
+
+type BodyViewMode = 'smart' | 'plain' | 'html' | 'raw'
+
+function decodeMimeWord(input: string) {
+  if (!input) return ''
+  return input.replace(/=\?([^?]+)\?([BQbq])\?([^?]+)\?=/g, (_match, charset, encoding, content) => {
+    try {
+      const cs = String(charset).toLowerCase().replace(/[^a-z0-9_-]/g, '')
+      if (String(encoding).toUpperCase() === 'B') {
+        const bytes = Uint8Array.from(atob(content), (c) => c.charCodeAt(0))
+        return new TextDecoder(cs).decode(bytes)
+      }
+      const qp = content.replace(/_/g, ' ').replace(/=([0-9A-Fa-f]{2})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
+      return new TextDecoder(cs).decode(Uint8Array.from(qp, (c) => c.charCodeAt(0)))
+    } catch {
+      return input
+    }
+  })
+}
+
+function stripHtml(html: string) {
+  return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+function extractHtmlBody(html: string) {
+  if (!html) return ''
+  const withoutCss = html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<!--([\s\S]*?)-->/g, ' ')
+  try {
+    const doc = new DOMParser().parseFromString(withoutCss, 'text/html')
+    doc.querySelectorAll('style, script, noscript').forEach((el) => el.remove())
+    const bodyText = doc.body?.innerText?.trim() || doc.body?.textContent?.trim() || ''
+    if (bodyText) return bodyText
+    const docText = doc.documentElement?.innerText?.trim() || doc.documentElement?.textContent?.trim() || ''
+    if (docText) return docText
+    return stripHtml(withoutCss)
+  } catch {
+    return stripHtml(withoutCss)
+  }
+}
+
+function looksLikeCssOnly(text: string) {
+  const s = text.trim()
+  if (!s) return true
+  if (/^@media\b/i.test(s)) return true
+  if (/^\s*[.#]?[a-z0-9_-]+\s*\{[^}]*\}$/is.test(s.slice(0, 800))) return true
+  return false
+}
+
+function extractBodyText(input: string) {
+  if (!input) return ''
+  const normalized = input.replace(/\r\n/g, '\n')
+  const candidate = normalized.split(/\n\n/).slice(1).join('\n\n') || normalized
+  return candidate.split('\n').filter((line) => !/^(date|from|subject|message-id|to|cc|bcc):/i.test(line.trim())).join('\n').trim()
+}
 
 export default function EmailPreview() {
-  const {
-    selectedEmailId, emails, setEmails,
-    folders, accounts, selectedFolderId,
-    setReplyToEmail, setComposeVisible,
-  } = useAppStore()
-
-  const [email, setEmail] = useState<Email | null>(null)
-  const [body, setBody] = useState<EmailBody | null>(null)
-  const [attachments, setAttachments] = useState<Attachment[]>([])
-  const [loading, setLoading] = useState(false)
-  const [htmlView, setHtmlView] = useState(true)
-
-  const loadEmail = useCallback(async (id: number) => {
-    setLoading(true)
-    try {
-      const [emailData, bodyData, attData] = await Promise.all([
-        window.electronAPI.email.getById(id),
-        window.electronAPI.email.getBody(id),
-        window.electronAPI.email.getAttachments(id),
-      ])
-
-      if (emailData) {
-        // Also fetch full body if not yet cached
-        if (!bodyData || !bodyData.text_html) {
-          const fullBody = await window.electronAPI.email.getBody(id)
-          setBody(fullBody)
-        } else {
-          setBody(bodyData)
-        }
-        setEmail(emailData)
-        setAttachments(attData || [])
-      }
-    } catch (err) {
-      console.error('Failed to load email:', err)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const { emails, selectedEmailId, emailBody, setEmailBody, setDebug, bumpMailChangeTick } = useAppStore()
+  const selectedMail = emails.find((mail) => mail.id === selectedEmailId) ?? emails[0]
+  const [loadingBody, setLoadingBody] = useState(false)
+  const [attachments, setAttachments] = useState<any[]>([])
+  const [mode, setMode] = useState<BodyViewMode>('smart')
+  const [panel, setPanel] = useState<'info' | 'attachments' | 'raw' | null>(null)
 
   useEffect(() => {
-    if (selectedEmailId) {
-      const found = emails.find((e: Email) => e.id === selectedEmailId)
-      if (found) {
-        setEmail(found)
-        setBody(null)
-        setAttachments([])
-        loadEmail(selectedEmailId)
+    let cancelled = false
+    ;(async () => {
+      if (!selectedMail || !window.electronAPI) return
+      setLoadingBody(true)
+      try {
+        const [body, atts] = await Promise.all([
+          window.electronAPI.email.getBody(selectedMail.id),
+          window.electronAPI.email.getAttachments(selectedMail.id).catch(() => []),
+        ])
+        if (!cancelled) {
+          setEmailBody(body)
+          setAttachments(atts || [])
+          setDebug({
+            bodyRawBytes: body?.rawBytes || 0,
+            bodySubject: body?.subject || '',
+            bodyTextLength: (body?.text_plain || '').length,
+            bodyHtmlLength: (body?.text_html || '').length,
+            bodyParts: body?.parts || 0,
+          })
+        }
+      } catch {
+        if (!cancelled) {
+          setEmailBody(null)
+          setAttachments([])
+          setDebug({ bodyRawBytes: 0, bodySubject: '', bodyTextLength: 0, bodyHtmlLength: 0, bodyParts: 0 })
+        }
+      } finally {
+        if (!cancelled) setLoadingBody(false)
       }
-    } else {
-      setEmail(null)
-      setBody(null)
-      setAttachments([])
+    })()
+    return () => { cancelled = true }
+  }, [selectedMail?.id, setEmailBody, setDebug])
+
+  const setStar = async () => { if (!selectedMail) return; try { await window.electronAPI.email.setStar([selectedMail.id], !selectedMail.is_starred); await refreshMailList(); bumpMailChangeTick() } catch { message.error('星标操作失败') } }
+  const markRead = async () => { if (!selectedMail) return; try { await window.electronAPI.email.setRead([selectedMail.id], true); await refreshMailList(); bumpMailChangeTick() } catch { message.error('标记已读失败') } }
+  const trash = async () => { if (!selectedMail) return; try { await window.electronAPI.email.delete([selectedMail.id]); message.success('已移入垃圾箱'); await refreshMailList(); bumpMailChangeTick(); const next = useAppStore.getState().emails.find((mail) => mail.id !== selectedMail.id); if (next) useAppStore.getState().setSelectedEmailId(next.id); else useAppStore.getState().setSelectedEmailId(null) } catch { message.error('删除失败') } }
+  const downloadAttachment = async (attachmentId: number) => {
+    try { const result = await window.electronAPI.email.downloadAttachment(attachmentId); if (result?.success) message.success('附件已保存'); else message.error(result?.error || '下载失败') } catch { message.error('下载失败') }
+  }
+
+  const displaySubject = useMemo(() => decodeMimeWord(selectedMail?.subject || '(无主题)'), [selectedMail?.subject])
+  const displayFrom = useMemo(() => decodeMimeWord(selectedMail?.from_name || selectedMail?.from_email || ''), [selectedMail?.from_name, selectedMail?.from_email])
+  const rawPlain = emailBody?.text_plain || ''
+  const rawHtml = emailBody?.text_html || ''
+  const rawSnippet = selectedMail?.snippet || ''
+
+  const displayBody = useMemo(() => {
+    const plain = decodeMimeWord(extractBodyText(rawPlain))
+    const html = decodeMimeWord(extractHtmlBody(rawHtml))
+    const snippet = decodeMimeWord(extractBodyText(rawSnippet))
+    const picked = plain || html || snippet || ''
+    if (looksLikeCssOnly(picked)) return '暂无正文预览'
+    return picked || '暂无正文预览'
+  }, [rawPlain, rawHtml, rawSnippet])
+
+  useEffect(() => {
+    if (!selectedMail || !window.electronAPI || loadingBody) return
+    if (displayBody === '暂无正文预览' && !emailBody) {
+      window.electronAPI.email.getBody(selectedMail.id).then((body) => {
+        if (!body) return
+        setEmailBody(body)
+        setDebug({
+          bodyRawBytes: body?.rawBytes || 0,
+          bodySubject: body?.subject || '',
+          bodyTextLength: (body?.text_plain || '').length,
+          bodyHtmlLength: (body?.text_html || '').length,
+          bodyParts: body?.parts || 0,
+        })
+      }).catch(() => {})
     }
-  }, [selectedEmailId])
+  }, [selectedMail?.id, displayBody, loadingBody, emailBody, setEmailBody, setDebug])
 
-  const handleReply = (replyAll: boolean) => {
-    if (email) {
-      setReplyToEmail(email)
-      setComposeVisible(true)
+  const bodyStatusText = useMemo(() => {
+    if (loadingBody) return '正文加载中，优先读取本地缓存...'
+    if (emailBody?.text_plain || emailBody?.text_html) return '正文已从本地缓存读取'
+    if (selectedMail?.body_fetched) return '正文已抓取，但当前内容为空'
+    return '正文暂未缓存，正在自动尝试从 IMAP 获取'
+  }, [loadingBody, emailBody?.text_plain, emailBody?.text_html, selectedMail?.body_fetched])
+
+  const effectiveBody = useMemo(() => {
+    const plain = decodeMimeWord(extractBodyText(rawPlain))
+    const html = decodeMimeWord(extractHtmlBody(rawHtml))
+    const snippet = decodeMimeWord(extractBodyText(rawSnippet))
+    const candidate = plain || html || snippet || ''
+    if (candidate && !looksLikeCssOnly(candidate)) return candidate
+    return bodyStatusText
+  }, [rawPlain, rawHtml, rawSnippet, bodyStatusText])
+
+  const bodyContent = useMemo(() => {
+    switch (mode) {
+      case 'plain': return decodeMimeWord(rawPlain || effectiveBody)
+      case 'html': return decodeMimeWord(extractHtmlBody(rawHtml || effectiveBody))
+      case 'raw': return [rawPlain, rawHtml, rawSnippet].filter(Boolean).join('\n\n-----\n\n') || effectiveBody
+      default: return effectiveBody
     }
-  }
+  }, [mode, rawPlain, rawHtml, rawSnippet, effectiveBody])
 
-  const handleForward = () => {
-    if (email) {
-      setReplyToEmail({ ...email, id: -1 } as any)
-      setComposeVisible(true)
-    }
-  }
+  if (!selectedMail) return <section className="mail-preview-pane panel-surface preview-empty-shell"><Empty description="请选择一封邮件查看内容" style={{ margin: 'auto' }} /></section>
 
-  const handleStar = async () => {
-    if (!email) return
-    const newStarred = email.is_starred ? 0 : 1
-    await window.electronAPI.email.setStar([email.id], !!newStarred)
-    setEmail({ ...email, is_starred: newStarred })
-    const updated = emails.map((e: Email) =>
-      e.id === email.id ? { ...e, is_starred: newStarred } : e
-    )
-    setEmails(updated)
-    message.success(newStarred ? '已标记星标' : '已取消星标')
-  }
-
-  const handleDelete = async () => {
-    if (!email) return
-    Modal.confirm({
-      title: '确认删除',
-      icon: <ExclamationCircleOutlined />,
-      content: '确定要删除这封邮件吗？',
-      okText: '删除',
-      okButtonProps: { danger: true },
-      onOk: async () => {
-        await window.electronAPI.email.delete([email.id])
-        const updated = emails.filter((e: Email) => e.id !== email.id)
-        setEmails(updated)
-        useAppStore.getState().setSelectedEmailId(null)
-        message.success('已删除')
-      },
-    })
-  }
-
-  const handleMove = async (folderId: number) => {
-    if (!email) return
-    await window.electronAPI.email.move([email.id], folderId)
-    const updated = emails.filter((e: Email) => e.id !== email.id)
-    setEmails(updated)
-    useAppStore.getState().setSelectedEmailId(null)
-    message.success('已移动')
-  }
-
-  const formatDate = (timestamp: number): string => {
-    const date = new Date(timestamp * 1000)
-    return date.toLocaleString('zh-CN', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  }
-
-  const formatFileSize = (bytes: number): string => {
-    if (bytes < 1024) return bytes + ' B'
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
-  }
-
-  const getEmailContent = (): { html: string; text: string } => {
-    if (!body) return { html: '', text: '' }
-
-    const html = body.text_html || ''
-    const text = body.text_plain || ''
-
-    if (htmlView && html) {
-      const cleanHtml = DOMPurify.sanitize(html, {
-        ALLOWED_TAGS: ['p', 'br', 'b', 'i', 'u', 'em', 'strong', 'a', 'img', 'blockquote',
-          'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'tr', 'td', 'th',
-          'div', 'span', 'pre', 'code', 'hr'],
-        ALLOWED_ATTR: ['href', 'src', 'alt', 'class', 'style', 'target', 'rel'],
-      })
-      return { html: cleanHtml, text }
-    }
-
-    return { html: '', text: text || '' }
-  }
-
-  const renderEmailHeader = () => {
-    if (!email) return null
-
-    const fromDisplay = email.from_name
-      ? `${email.from_name} <${email.from_email}>`
-      : email.from_email
-
-    const toList: any[] = JSON.parse(email.to_list || '[]')
-    const ccList: any[] = JSON.parse(email.cc_list || '[]')
-
-    return (
-      <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-        <h2 className="text-lg font-semibold mb-3 leading-snug">{email.subject || '(无主题)'}</h2>
-        <div className="flex items-start gap-3">
-          <div className="w-10 h-10 rounded-full bg-blue-500 flex items-center justify-center text-white font-medium flex-shrink-0">
-            {(email.from_name || email.from_email)[0].toUpperCase()}
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center justify-between">
-              <div>
-                <span className="font-medium">{email.from_name || email.from_email.split('@')[0]}</span>
-                <span className="text-gray-500 text-sm ml-2">&lt;{email.from_email}&gt;</span>
-              </div>
-              <span className="text-xs text-gray-400">{formatDate(email.date)}</span>
-            </div>
-            <div className="text-sm text-gray-600 dark:text-gray-400 mt-1 space-y-0.5">
-              <div><span className="text-gray-400">收件人：</span>{toList.join(', ')}</div>
-              {ccList.length > 0 && (
-                <div><span className="text-gray-400">抄送：</span>{ccList.join(', ')}</div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  const renderEmailActions = () => {
-    if (!email) return null
-
-    const folderOptions = folders
-      .filter((f: any) => f.id !== selectedFolderId && f.account_id === email.account_id)
-      .map((f: any) => ({ key: f.id, label: f.name }))
-
-    return (
-      <div className="flex items-center gap-1 px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
-        <Tooltip title="回复">
-          <Button size="small" icon={<RetweetOutlined />} onClick={() => handleReply(false)}>回复</Button>
-        </Tooltip>
-        <Tooltip title="回复全部">
-          <Button size="small" icon={<SwapLeftOutlined />} onClick={() => handleReply(true)}>回复全部</Button>
-        </Tooltip>
-        <Tooltip title="转发">
-          <Button size="small" icon={<ForwardOutlined />} onClick={handleForward}>转发</Button>
-        </Tooltip>
-        <Divider type="vertical" />
-        <Tooltip title={email.is_starred ? '取消星标' : '标记星标'}>
-          <Button
-            size="small"
-            icon={email.is_starred ? <StarFilled style={{ color: '#eab308' }} /> : <StarOutlined />}
-            onClick={handleStar}
-          />
-        </Tooltip>
-        <Dropdown menu={{ items: folderOptions, onClick: ({ key }) => handleMove(Number(key)) }}>
-          <Button size="small" icon={<RollbackOutlined />}>移动</Button>
-        </Dropdown>
-        <Tooltip title="删除">
-          <Button size="small" danger icon={<DeleteOutlined />} onClick={handleDelete} />
-        </Tooltip>
-        <div className="flex-1" />
-        <Dropdown
-          menu={{
-            items: [
-              { key: 'print', label: '打印', icon: <PrinterOutlined />, onClick: () => window.print() },
-              { key: 'raw', label: '查看原文', icon: <MailOutlined /> },
-            ]
-          }}
-        >
-          <Button size="small" icon={<MoreOutlined />} />
-        </Dropdown>
-      </div>
-    )
-  }
-
-  const renderAttachments = () => {
-    if (attachments.length === 0) return null
-
-    return (
-      <div className="px-6 py-3 border-t border-gray-200 dark:border-gray-700">
-        <div className="text-sm font-medium mb-2 flex items-center gap-2">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" className="text-gray-400">
-            <path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5a2.5 2.5 0 0 1 5 0v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5a2.5 2.5 0 0 0 5 0V5c0-1.38-1.12-2.5-2.5-2.5S10 3.62 10 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-4.5z"/>
-          </svg>
-          附件 ({attachments.length})
-        </div>
-        <div className="flex flex-wrap gap-2">
-          {attachments.map((att: Attachment) => (
-            <div
-              key={att.id}
-              className="attachment-chip"
-              onClick={async () => {
-                const result = await window.electronAPI.email.downloadAttachment(att.id)
-                if (result.success) message.success('下载完成')
-              }}
-            >
-              <MailOutlined />
-              <span className="font-medium">{att.filename}</span>
-              <span className="text-gray-400">({formatFileSize(att.size)})</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    )
-  }
-
-  if (!selectedEmailId) {
-    return (
-      <div className="flex items-center justify-center h-full text-gray-400">
-        <div className="text-center">
-          <MailOutlined style={{ fontSize: 48 }} />
-          <p className="mt-2 text-sm">选择一封邮件查看详情</p>
-        </div>
-      </div>
-    )
-  }
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <Spin size="large" />
-      </div>
-    )
-  }
-
-  const { html, text } = getEmailContent()
+  const metaItems = [
+    { children: `日期：${new Date(selectedMail.date * 1000).toLocaleString()}` },
+    { children: `发件人：${displayFrom || '未知'}` },
+    { children: `主题：${displaySubject}` },
+    { children: `消息 ID：${selectedMail.message_id || '无'}` },
+  ]
 
   return (
-    <div className="flex flex-col h-full bg-white dark:bg-gray-900">
-      {renderEmailActions()}
-      {renderEmailHeader()}
-
-      {/* View toggle */}
-      {html && text && (
-        <div className="px-4 py-1 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/30">
-          <Tabs
-            size="small"
-            activeKey={htmlView ? 'html' : 'text'}
-            onChange={(key) => setHtmlView(key === 'html')}
-            items={[
-              { key: 'html', label: '富文本' },
-              { key: 'text', label: '纯文本' },
-            ]}
-            style={{ marginBottom: 0 }}
-          />
+    <section className="mail-preview-pane panel-surface">
+      <div className="pane-header">
+        <div>
+          <Text type="secondary">当前邮件</Text>
+          <Title level={3} style={{ marginTop: 8 }}>{displaySubject}</Title>
+          <Space wrap><Text strong>{displayFrom}</Text><Tag color="blue">{selectedMail.tags?.[0]?.name || '邮件'}</Tag><Tag color="geekblue">附件 {attachments.length}</Tag><Text type="secondary">{new Date(selectedMail.date * 1000).toLocaleString()}</Text></Space>
         </div>
-      )}
-
-      {/* Body */}
-      <div className="flex-1 overflow-y-auto px-6 py-4">
-        {htmlView && html ? (
-          <div
-            className="email-body"
-            dangerouslySetInnerHTML={{ __html: html }}
-            style={{
-              lineHeight: 1.8,
-              wordBreak: 'break-word',
-              fontSize: 14,
-            }}
-          />
-        ) : text ? (
-          <pre className="whitespace-pre-wrap text-sm leading-relaxed" style={{ fontFamily: 'inherit' }}>
-            {text}
-          </pre>
-        ) : (
-          <div className="text-gray-400 text-center mt-8">
-            <p>邮件正文加载中...</p>
-            <Button type="link" onClick={() => loadEmail(selectedEmailId!)}>
-              重新加载
-            </Button>
-          </div>
-        )}
+        <Space><Button icon={selectedMail.is_starred ? <StarFilled /> : <StarOutlined />} onClick={setStar} /><Button icon={<MailOutlined />} onClick={markRead}>已读</Button><Button icon={<DeleteOutlined />} onClick={trash}>删除</Button><Button icon={<CompassOutlined />}>回复</Button></Space>
       </div>
 
-      {renderAttachments()}
-    </div>
+      <Card className="panel-surface-strong preview-body-card" bordered={false} style={{ borderRadius: 24, margin: 20, marginBottom: 0 }}>
+        <Space direction="vertical" size={12} style={{ width: '100%', minHeight: 0 }}>
+          <Segmented value={mode} onChange={(value) => setMode(value as BodyViewMode)} options={[{ label: '智能', value: 'smart' }, { label: '纯文本', value: 'plain' }, { label: 'HTML', value: 'html' }, { label: '原始', value: 'raw' }]} />
+          <div className="preview-body-scroll">
+            <Text type="secondary">{bodyStatusText}</Text>
+            <Paragraph style={{ fontSize: 16, lineHeight: 1.9, marginBottom: 0, whiteSpace: 'pre-wrap' }}>{loadingBody ? '正在加载正文...' : bodyContent}</Paragraph>
+            {mode !== 'raw' && bodyContent.length > 0 && rawHtml && /@media|display:\s*none|position:\s*absolute|font-family/i.test(rawHtml) ? (
+              <Text type="secondary">检测到邮件内容是营销/响应式 HTML，已自动提取可读正文。</Text>
+            ) : null}
+          </div>
+        </Space>
+      </Card>
+
+      <Drawer open={panel !== null} onClose={() => setPanel(null)} width={320} title={panel === 'info' ? '邮件信息' : panel === 'attachments' ? '附件' : '原始内容'}>
+        {panel === 'info' ? (
+          <Space direction="vertical" style={{ width: '100%' }} size={8}>{metaItems.map((item, index) => <div key={index} className="preview-mini-line"><span className="preview-mini-dot" /><Text>{item.children}</Text></div>)}</Space>
+        ) : panel === 'attachments' ? (
+          <Space direction="vertical" style={{ width: '100%' }} size={6}>{attachments.length === 0 ? <Text type="secondary">无附件</Text> : attachments.map((att) => <div key={att.id} className="attachment-row"><Text ellipsis style={{ minWidth: 0 }}>{att.filename}</Text><Button size="small" icon={<DownloadOutlined />} onClick={() => downloadAttachment(att.id)}>下载</Button></div>)}</Space>
+        ) : (
+          <Paragraph style={{ whiteSpace: 'pre-wrap', fontSize: 12, lineHeight: 1.6 }}>{rawPlain || rawHtml || rawSnippet || '无原始内容'}</Paragraph>
+        )}
+      </Drawer>
+    </section>
   )
 }

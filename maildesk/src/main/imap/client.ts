@@ -6,81 +6,169 @@ import { shell } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import iconv from 'iconv-lite'
+import dns from 'dns'
+import net from 'net'
 
-export async function testAccountConnection(config: any): Promise<{ success: boolean; error?: string }> {
-  if (!config.imap_host || !config.imap_host.trim()) {
-    return { success: false, error: 'IMAP 服务器地址不能为空' }
-  }
-  if (!config.imap_user || !config.imap_user.trim()) {
-    return { success: false, error: '用户名不能为空' }
-  }
-  if (!config.imap_password) {
-    return { success: false, error: '密码/授权码不能为空' }
-  }
+function imapDebug(step: string, data: any = {}): void {
+  log.info(`[imap-debug] ${step}`, data)
+}
 
-  return new Promise((resolve) => {
-    const imap = new Imap({
-      user: config.imap_user,
-      password: config.imap_password,
-      host: config.imap_host,
-      port: config.imap_port || 993,
-      tls: !!config.imap_use_tls,
-      tlsOptions: { rejectUnauthorized: false },
-      connTimeout: 15000,
-      authTimeout: 15000,
-    })
+function cleanMailText(input: string): string {
+  if (!input) return ''
+  return input
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .filter((line) => !/^(date|from|subject|message-id|to|cc|bcc):/i.test(line.trim()))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
 
-    imap.once('ready', () => {
-      // Send ID command for 163/网易邮箱 compatibility
-      const idStr = '("NAME" "MailDesk" "VERSION" "1.0.0" "VENDOR" "MailDesk Team")'
-      ;(imap as any)._enqueue(`ID ${idStr}`, () => {})
-
-      imap.openBox('INBOX', false, (err) => {
-        if (err) {
-          log.error('IMAP INBOX test failed:', err.message)
-          imap.end()
-          resolve({ success: false, error: err.message })
-        } else {
-          log.info('IMAP connection verified: INBOX accessible')
-          imap.end()
-          resolve({ success: true })
-        }
-      })
-    })
-
-    imap.once('error', (err: Error) => {
-      log.error('IMAP connection test failed:', err.message)
-      resolve({ success: false, error: err.message })
-    })
-
-    imap.connect()
+function decodeHeaderValue(value: string): string {
+  if (!value) return ''
+  return value.replace(/=\?([^?]+)\?([BQbq])\?([^?]+)\?=/g, (_match, charset, encoding, content) => {
+    try {
+      const cs = String(charset).toLowerCase().replace(/[^a-z0-9_-]/g, '')
+      if (String(encoding).toUpperCase() === 'B') {
+        const bytes = Uint8Array.from(atob(content), (c) => c.charCodeAt(0))
+        return new TextDecoder(cs).decode(bytes)
+      }
+      const qp = content.replace(/_/g, ' ').replace(/=([0-9A-Fa-f]{2})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
+      return new TextDecoder(cs).decode(Uint8Array.from(qp, (c) => c.charCodeAt(0)))
+    } catch {
+      return value
+    }
   })
 }
 
-export async function connectImap(accountConfig: any): Promise<Imap> {
+function decodeMimeText(raw: string): string {
+  if (!raw) return ''
+  return decodeHeaderValue(raw)
+}
+
+function collectBuffer(fetcher: any): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const imap = new Imap({
-      user: accountConfig.imap_user,
-      password: accountConfig.imap_password,
-      host: accountConfig.imap_host,
-      port: accountConfig.imap_port || 993,
-      tls: !!accountConfig.imap_use_tls,
-      tlsOptions: { rejectUnauthorized: false },
-      connTimeout: 15000,
-      authTimeout: 15000,
+    const chunks: Buffer[] = []
+    let resolved = false
+    fetcher.on('message', (msg: any) => {
+      msg.on('body', (stream: any) => {
+        stream.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
+        stream.once('end', () => {
+          if (resolved) return
+          resolved = true
+          resolve(Buffer.concat(chunks))
+        })
+      })
     })
-
-    imap.once('ready', () => {
-      // 163/网易邮箱要求在 SELECT 之前发送 ID 命令 (RFC 2971)，否则返回 "Unsafe Login"
-      sendImapId(imap).then(() => resolve(imap)).catch(reject)
-    })
-    imap.once('error', (err: Error) => {
-      log.error(`IMAP connection error for ${accountConfig.email}:`, err.message)
-      reject(err)
-    })
-
-    imap.connect()
+    fetcher.once('error', (err: Error) => { if (!resolved) { resolved = true; reject(err) } })
+    fetcher.once('end', () => { if (!resolved) { resolved = true; resolve(Buffer.concat(chunks)) } })
   })
+}
+
+function extractFromRawMime(raw: string): { textPlain: string; textHtml: string } {
+  const normalized = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  const headerEnd = normalized.indexOf('\n\n')
+  if (headerEnd < 0) return { textPlain: '', textHtml: '' }
+  const headerText = normalized.slice(0, headerEnd)
+  const bodyText = normalized.slice(headerEnd + 2)
+  const headers: Record<string, string> = {}
+  for (const line of headerText.split('\n')) {
+    const idx = line.indexOf(':')
+    if (idx > 0) headers[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim()
+  }
+  const contentType = headers['content-type'] || ''
+  const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/i)
+  if (!/multipart\//i.test(contentType) || !boundaryMatch) return { textPlain: '', textHtml: '' }
+
+  const boundary = `--${boundaryMatch[1]}`
+  const parts = bodyText.split(boundary).map((p) => p.trim()).filter(Boolean)
+  let textPlain = ''
+  let textHtml = ''
+
+  for (const part of parts) {
+    if (part === '--') continue
+    const partHeaderEnd = part.indexOf('\n\n')
+    if (partHeaderEnd < 0) continue
+    const partHeaderText = part.slice(0, partHeaderEnd)
+    let partBody = part.slice(partHeaderEnd + 2).trim()
+    const partHeaders: Record<string, string> = {}
+    for (const line of partHeaderText.split('\n')) {
+      const idx = line.indexOf(':')
+      if (idx > 0) partHeaders[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim()
+    }
+    const pType = (partHeaders['content-type'] || '').toLowerCase()
+    const encoding = (partHeaders['content-transfer-encoding'] || '').toLowerCase()
+
+    if (encoding.includes('base64')) {
+      try { partBody = Buffer.from(partBody.replace(/\s+/g, ''), 'base64').toString('utf8') } catch {}
+    } else if (encoding.includes('quoted-printable')) {
+      partBody = partBody.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+    }
+
+    if (/text\/plain/i.test(pType) && !textPlain) textPlain = cleanMailText(decodeMimeText(partBody))
+    if (/text\/html/i.test(pType) && !textHtml) textHtml = htmlToReadableText(decodeMimeText(partBody))
+  }
+
+  return { textPlain, textHtml }
+}
+
+function decodeBodyText(raw: string): string {
+  if (!raw) return ''
+  let text = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  text = text.replace(/^.*?\n\n/s, '')
+  if (/Content-Transfer-Encoding:\s*base64/i.test(raw)) {
+    try { text = Buffer.from(text.replace(/\s+/g, ''), 'base64').toString('utf8') } catch {}
+  } else if (/Content-Transfer-Encoding:\s*quoted-printable/i.test(raw)) {
+    text = text.replace(/=\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_m, h) => String.fromCharCode(parseInt(h, 16)))
+  }
+  return cleanMailText(decodeMimeText(text))
+}
+
+function shouldIgnoreAsBody(text: string): boolean {
+  if (!text) return true
+  const normalized = text.trim()
+  if (!normalized) return true
+  if (/^@media\b/i.test(normalized)) return true
+  if (/^\s*\.mailmaster-|^\s*#mailcontent|^\s*\.ntes-edm-/i.test(normalized)) return true
+  if (/^\s*[.#]?[a-z0-9_-]+\s*\{[^}]*\}$/is.test(normalized.slice(0, 500))) return true
+  return false
+}
+
+function htmlToReadableText(html: string): string {
+  if (!html) return ''
+  const withoutCss = html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<!--([\s\S]*?)-->/g, ' ')
+  const unescaped = withoutCss
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+  const text = unescaped.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+  return cleanMailText(text)
+}
+
+function pickReadableText(parsed: any, raw?: string): { textPlain: string; textHtml: string } {
+  let plain = cleanMailText(String(parsed?.text || ''))
+  let html = htmlToReadableText(String(parsed?.html || ''))
+  if (shouldIgnoreAsBody(plain)) plain = ''
+  if (shouldIgnoreAsBody(html)) html = ''
+  if ((!plain && !html) && raw) {
+    const fallback = extractFromRawMime(raw)
+    plain = plain || fallback.textPlain
+    html = html || fallback.textHtml
+    if (shouldIgnoreAsBody(plain)) plain = ''
+    if (shouldIgnoreAsBody(html)) html = ''
+    if (!plain && !html) {
+      plain = decodeBodyText(raw)
+      if (shouldIgnoreAsBody(plain)) plain = ''
+    }
+  }
+  return { textPlain: plain, textHtml: html }
 }
 
 function sendImapId(imap: any): Promise<void> {
@@ -90,51 +178,109 @@ function sendImapId(imap: any): Promise<void> {
     imap._enqueue(`ID ${idStr}`, (err: Error | null) => {
       if (err) {
         log.warn('[IMAP] ID command failed (non-fatal):', err.message)
+        imapDebug('id-command:error', { error: err.message })
       } else {
-        log.info('[IMAP] ID command sent successfully')
+        imapDebug('id-command:success')
       }
       resolve()
     })
   })
 }
 
+async function diagnoseImapEndpoint(host: string, port: number): Promise<{ resolved?: string[]; preferredHost?: string; tcp?: string; warning?: string }> {
+  const result: { resolved?: string[]; preferredHost?: string; tcp?: string; warning?: string } = {}
+  try {
+    const resolved = await dns.promises.lookup(host, { all: true })
+    result.resolved = resolved.map((item) => item.address)
+    result.preferredHost = resolved.find((item) => item.family === 4)?.address || resolved[0]?.address
+  } catch (err: any) {
+    result.warning = `DNS 解析失败: ${err?.message || String(err)}`
+    return result
+  }
+
+  const probeHost = result.preferredHost || host
+  await new Promise<void>((resolve) => {
+    const socket = net.createConnection({ host: probeHost, port })
+    const timer = setTimeout(() => {
+      result.tcp = `TCP 连接超时 (${probeHost}:${port})`
+      socket.destroy()
+      resolve()
+    }, 5000)
+
+    socket.once('connect', () => {
+      clearTimeout(timer)
+      result.tcp = `TCP 连接成功 (${probeHost}:${port})`
+      socket.end()
+      resolve()
+    })
+
+    socket.once('error', (err: Error & { code?: string }) => {
+      clearTimeout(timer)
+      result.tcp = `TCP 连接失败: ${err.code || ''} ${err.message}`.trim()
+      resolve()
+    })
+  })
+
+  return result
+}
+
+export async function testAccountConnection(config: any): Promise<{ success: boolean; error?: string }> {
+  imapDebug('test-connection:start', { host: config.imap_host, port: config.imap_port, user: config.imap_user, tls: !!config.imap_use_tls })
+  if (!config.imap_host || !config.imap_host.trim()) return { success: false, error: 'IMAP 服务器地址不能为空' }
+  if (!config.imap_user || !config.imap_user.trim()) return { success: false, error: '用户名不能为空' }
+  if (!config.imap_password) return { success: false, error: '密码/授权码不能为空' }
+
+  const port = config.imap_port || 993
+  const endpoint = await diagnoseImapEndpoint(config.imap_host, port)
+  if (endpoint.warning) {
+    imapDebug('test-connection:dns-failed', endpoint)
+    return { success: false, error: endpoint.warning }
+  }
+  imapDebug('test-connection:endpoint', endpoint)
+  if (endpoint.tcp && endpoint.tcp.includes('超时')) {
+    return { success: false, error: endpoint.tcp }
+  }
+
+  return new Promise((resolve) => {
+    const imap = new Imap({ user: config.imap_user, password: config.imap_password, host: endpoint.preferredHost || config.imap_host, port, tls: !!config.imap_use_tls, tlsOptions: { rejectUnauthorized: false, servername: config.imap_host, minVersion: 'TLSv1.2' }, connTimeout: 30000, authTimeout: 30000 })
+    imap.once('ready', () => { sendImapId(imap).then(() => { imap.openBox('INBOX', false, (err) => { if (err) { imap.end(); resolve({ success: false, error: err.message }) } else { imap.end(); resolve({ success: true }) } }) }) })
+    imap.once('error', (err: Error) => resolve({ success: false, error: `${err.message}${endpoint.tcp ? `；${endpoint.tcp}` : ''}` }))
+    imap.connect()
+  })
+}
+
+export async function connectImap(accountConfig: any): Promise<Imap> {
+  imapDebug('connect:start', { accountId: accountConfig.id, email: accountConfig.email, host: accountConfig.imap_host, port: accountConfig.imap_port, tls: !!accountConfig.imap_use_tls, user: accountConfig.imap_user })
+  const port = accountConfig.imap_port || 993
+  const endpoint = await diagnoseImapEndpoint(accountConfig.imap_host, port)
+  imapDebug('connect:endpoint', { ...endpoint, accountId: accountConfig.id, host: accountConfig.imap_host, port })
+  if (endpoint.warning) {
+    throw new Error(endpoint.warning)
+  }
+
+  return new Promise((resolve, reject) => {
+    const imap = new Imap({ user: accountConfig.imap_user, password: accountConfig.imap_password, host: endpoint.preferredHost || accountConfig.imap_host, port, tls: !!accountConfig.imap_use_tls, tlsOptions: { rejectUnauthorized: false, servername: accountConfig.imap_host, minVersion: 'TLSv1.2' }, connTimeout: 30000, authTimeout: 30000 })
+    imap.once('ready', () => { sendImapId(imap).then(() => resolve(imap)).catch(() => resolve(imap)) })
+    imap.once('error', (err: Error) => reject(new Error(`${err.message}${endpoint.tcp ? `；${endpoint.tcp}` : ''}`)))
+    imap.connect()
+  })
+}
+
 export async function fetchFolderList(imap: Imap, accountId: number): Promise<void> {
   return new Promise((resolve, reject) => {
     imap.getBoxes('', (err: Error | null, boxes: any) => {
-      if (err) {
-        log.error('[fetchFolderList] getBoxes error:', err.message)
-        reject(err)
-        return
-      }
-
+      if (err) return reject(err)
       const db = getDb()
-      let folderCount = 0
       const processBoxes = (boxObj: any, parentPath: string, parentId: string) => {
-        for (const [name, box] of Object.entries(boxObj)) {
+        for (const [name, box] of Object.entries(boxObj || {})) {
           const b = box as any
           const fullPath = parentPath ? `${parentPath}${name}` : name
           const folderType = inferFolderType(name, b)
-          db.prepare(`
-            INSERT OR REPLACE INTO folders (account_id, remote_id, name, path, parent_remote_id, type, subscribed)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `).run(accountId, fullPath, name, fullPath, parentId, folderType, 1)
-          log.info(`[fetchFolderList] Folder: name="${name}", path="${fullPath}", type="${folderType}"`)
-          folderCount++
-          if (b.children) {
-            processBoxes(b.children, `${fullPath}`, fullPath)
-          }
+          upsertFolder(db, accountId, fullPath, name, fullPath, parentId, folderType)
+          if (b.children) processBoxes(b.children, fullPath, fullPath)
         }
       }
-
-      try {
-        processBoxes(boxes, '', '')
-        saveDatabase()
-        log.info(`[fetchFolderList] Total folders fetched for account ${accountId}: ${folderCount}`)
-        resolve()
-      } catch (e) {
-        log.error('[fetchFolderList] error:', e)
-        reject(e)
-      }
+      try { processBoxes(boxes, '', ''); saveDatabase(); resolve() } catch (e) { reject(e) }
     })
   })
 }
@@ -142,261 +288,121 @@ export async function fetchFolderList(imap: Imap, accountId: number): Promise<vo
 function inferFolderType(name: string, box: any): string {
   const lower = name.toLowerCase()
   if (lower === 'inbox') return 'inbox'
-  if (lower === '[gmail]/sent' || lower === 'sent' || lower === '已发送') return 'sent'
-  if (lower === '[gmail]/drafts' || lower === 'drafts' || lower === '草稿') return 'drafts'
-  if (lower === '[gmail]/trash' || lower === 'trash' || lower === '[gmail]/bin' || lower === '已删除') return 'trash'
-  if (lower === '[gmail]/spam' || lower === 'spam' || lower === '垃圾邮件') return 'spam'
-  if (lower === '[gmail]/starred' || lower === 'starred') return 'starred'
-  if (lower === '[gmail]/important' || lower === 'important') return 'important'
-  if (box.attribs?.includes('\\Sent')) return 'sent'
-  if (box.attribs?.includes('\\Drafts')) return 'drafts'
-  if (box.attribs?.includes('\\Trash')) return 'trash'
-  if (box.attribs?.includes('\\Spam')) return 'spam'
+  if (lower === 'sent' || lower === '已发送') return 'sent'
+  if (lower === 'drafts' || lower === '草稿') return 'drafts'
+  if (lower === 'trash' || lower === '已删除') return 'trash'
+  if (lower === 'spam' || lower === '垃圾邮件') return 'spam'
   return 'mail'
+}
+
+function upsertFolder(db: any, accountId: number, remoteId: string, name: string, fullPath: string, parentId: string, folderType: string): void {
+  db.prepare(`
+    INSERT INTO folders (account_id, remote_id, name, path, parent_remote_id, type, subscribed)
+    VALUES (?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(account_id, remote_id) DO UPDATE SET
+      name=excluded.name,
+      path=excluded.path,
+      parent_remote_id=excluded.parent_remote_id,
+      type=excluded.type,
+      subscribed=1
+  `).run(accountId, remoteId, name, fullPath, parentId, folderType)
 }
 
 export async function syncEmails(imap: Imap, accountId: number, folderId: number, onProgress?: (p: number) => void): Promise<number> {
   const db = getDb()
-
   const folder = db.prepare('SELECT * FROM folders WHERE id=?').get(folderId) as any
   if (!folder) return 0
 
-  log.info(`[syncEmails] Starting sync for folder: id=${folderId}, name=${folder.name}, path=${folder.path}, type=${folder.type}`)
-
   return new Promise((resolve, reject) => {
-    const mailboxPath = folder.path === 'INBOX' ? 'INBOX' : folder.path
-
-    imap.openBox(mailboxPath, false, (err: Error | null) => {
-      if (err) {
-        log.error(`[syncEmails] Failed to open mailbox "${mailboxPath}":`, err.message)
-        reject(err)
-        return
-      }
-
-      log.info(`[syncEmails] Opened mailbox "${mailboxPath}"`)
-
-      // imap.search() automatically prepends "UID " prefix, so ['ALL'] becomes "UID SEARCH ALL"
+    imap.openBox(folder.path === 'INBOX' ? 'INBOX' : folder.path, false, (err: Error | null) => {
+      if (err) return reject(err)
       imap.search(['ALL'], (searchErr: Error | null, uids: number[]) => {
-        if (searchErr) {
-          log.error(`[syncEmails] UID SEARCH failed:`, searchErr.message)
-          imap.closeBox(true, () => {})
-          reject(searchErr)
-          return
-        }
-
-        if (!uids || uids.length === 0) {
-          log.info(`[syncEmails] No messages found in "${mailboxPath}"`)
-          imap.closeBox(true, () => {})
-          resolve(0)
-          return
-        }
-
-        log.info(`[syncEmails] Found ${uids.length} messages in "${mailboxPath}", fetching...`)
-
-        // Fetch headers for all UIDs at once
-        const fetcher = imap.fetch(uids, {
-          bodies: 'HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES X-PRIORITY)',
-          struct: true,
-        })
-
+        if (searchErr) return reject(searchErr)
+        if (!uids?.length) return resolve(0)
         let count = 0
-
+        const fetcher = imap.fetch(uids, { bodies: '', struct: true })
         fetcher.on('message', (msg: any, seqno: number) => {
-          msg.on('body', (stream: any, info: any) => {
-            let buffer = ''
-            stream.on('data', (chunk: Buffer) => { buffer += chunk.toString('utf8') })
-            stream.once('end', () => {
+          msg.on('body', (stream: any) => {
+            const chunks: Buffer[] = []
+            stream.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
+            stream.once('end', async () => {
               try {
-                const header = Imap.parseHeader(buffer)
-                const uid = msg.uid || seqno
-                const messageId = header['message-id']?.[0] || `local-${Date.now()}-${uid}`
-                const subject = decodeSubject(header.subject?.[0] || '(无主题)')
-                const fromEmail = header.from?.[0] || ''
-                const fromName = extractName(header['from']?.[0] || '')
-                const toList = JSON.stringify(header.to || [])
-                const ccList = JSON.stringify(header.cc || [])
-                const bccList = JSON.stringify(header.bcc || [])
-                const date = header.date?.[0] ? new Date(header.date[0]).getTime() / 1000 : Math.floor(Date.now() / 1000)
-                const priority = extractPriority(header)
-                const flags = msg.flags || []
-                const snippet = extractSnippet(buffer)
-
-                db.prepare(`
-                  INSERT OR REPLACE INTO emails
-                  (account_id, folder_id, uid, message_id, in_reply_to, references_id, subject, from_name, from_email, to_list, cc_list, bcc_list, date, size, has_attachments, is_read, is_starred, is_draft, is_sent, priority, snippet)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `).run(
-                  accountId, folderId, uid, messageId,
-                  header['in-reply-to']?.[0] || '',
-                  header.references?.[0] || '',
-                  subject, fromName, fromEmail, toList, ccList, bccList, date, 0,
-                  0, flags.includes('\\Seen') ? 1 : 0,
-                  flags.includes('\\Flagged') ? 1 : 0,
-                  flags.includes('\\Draft') ? 1 : 0,
-                  folder.type === 'sent' ? 1 : 0,
-                  priority, snippet
-                )
+                const raw = Buffer.concat(chunks)
+                const parsed = await simpleParser(raw)
+                const { textPlain, textHtml } = pickReadableText(parsed, raw.toString('binary'))
+                const subject = decodeHeaderValue(String(parsed.subject || '(无主题)'))
+                const fromEmail = parsed.from?.value?.[0]?.address || parsed.from?.text || ''
+                const fromName = decodeHeaderValue(parsed.from?.value?.[0]?.name || parsed.from?.text || '')
+                const toList = JSON.stringify(parsed.to?.value?.map((v: any) => v.address) || [])
+                const ccList = JSON.stringify(parsed.cc?.value?.map((v: any) => v.address) || [])
+                const bccList = JSON.stringify(parsed.bcc?.value?.map((v: any) => v.address) || [])
+                const messageId = parsed.messageId || ''
+                const existingEmail = db.prepare('SELECT id FROM emails WHERE account_id=? AND folder_id=? AND uid=?').get(accountId, folderId, msg.uid || seqno) as any
+                const duplicateByMeta = db.prepare(`
+                  SELECT id FROM emails
+                  WHERE account_id=?
+                    AND folder_id=?
+                    AND COALESCE(NULLIF(message_id,''), '')=?
+                    AND COALESCE(NULLIF(subject,''), '')=?
+                    AND COALESCE(date / 86400, 0)=COALESCE(? / 86400, 0)
+                  ORDER BY is_read ASC, is_starred DESC, is_sent DESC, created_at ASC, id ASC LIMIT 1
+                `).get(accountId, folderId, messageId || '', subject || '', Math.floor((parsed.date?.getTime?.() || Date.now()) / 1000)) as any
+                const inserted = existingEmail ? { lastInsertRowid: existingEmail.id } : duplicateByMeta ? { lastInsertRowid: duplicateByMeta.id } : db.prepare(`INSERT INTO emails (account_id, folder_id, uid, message_id, in_reply_to, references_id, subject, from_name, from_email, to_list, cc_list, bcc_list, date, size, has_attachments, is_read, is_starred, is_draft, is_sent, priority, snippet, body_fetched) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+                  .run(accountId, folderId, msg.uid || seqno, messageId, parsed.inReplyTo || '', Array.isArray(parsed.references) ? parsed.references.join(' ') : '', subject, fromName, fromEmail, toList, ccList, bccList, Math.floor((parsed.date?.getTime?.() || Date.now()) / 1000), raw.length, parsed.attachments?.length ? 1 : 0, 0, 0, 0, folder.type === 'sent' ? 1 : 0, 'normal', textPlain.slice(0, 150), (textPlain || textHtml) ? 1 : 0)
+                const emailId = Number(inserted.lastInsertRowid || existingEmail?.id || duplicateByMeta?.id || 0)
+                if (emailId && (textPlain || textHtml)) {
+                  db.prepare('INSERT OR REPLACE INTO email_bodies (email_id, text_html, text_plain, fetched_at) VALUES (?, ?, ?, unixepoch())').run(emailId, textHtml, textPlain)
+                }
+                db.prepare('UPDATE emails SET message_id=COALESCE(NULLIF(message_id, \'\'), ?), body_fetched=?, snippet=COALESCE(NULLIF(snippet, \'\'), ?) WHERE account_id=? AND folder_id=? AND uid=?')
+                  .run(messageId || `local-${accountId}-${folderId}-${msg.uid || seqno}`, (textPlain || textHtml) ? 1 : 0, textPlain.slice(0, 150), accountId, folderId, msg.uid || seqno)
                 count++
-
-                if (onProgress) {
-                  onProgress(Math.round((count / uids.length) * 100))
-                }
+                if (onProgress) onProgress(Math.round((count / uids.length) * 100))
               } catch (e) {
-                log.error('[syncEmails] Failed to parse email header:', e)
+                imapDebug('emails:parse:error', { accountId, folderId, error: (e as any)?.message || String(e) })
               }
             })
           })
-
-          msg.once('attributes', (attrs: any) => {
-            const hasAttachments = attrs.struct?.some((part: any) => {
-              return part.disposition?.type?.toLowerCase() === 'attachment' ||
-                (part.disposition?.type?.toLowerCase() === 'inline' && part.disposition?.attributes?.filename)
-            })
-
-            if (hasAttachments && attrs.struct) {
-              const uid = attrs.uid || msg.uid || seqno
-              db.prepare('UPDATE emails SET has_attachments=1 WHERE account_id=? AND folder_id=? AND uid=?')
-                .run(accountId, folderId, uid)
-
-              for (const part of attrs.struct) {
-                if (part.disposition?.type?.toLowerCase() === 'attachment' ||
-                    (part.disposition?.type?.toLowerCase() === 'inline' && part.disposition?.attributes?.filename)) {
-                  const filename = part.disposition?.attributes?.filename ||
-                    part.params?.name || `attachment_${part.partID}`
-                  db.prepare(`
-                    INSERT OR IGNORE INTO attachments (email_id, filename, content_type, size, part_id)
-                    VALUES ((SELECT id FROM emails WHERE account_id=? AND folder_id=? AND uid=?), ?, ?, ?, ?)
-                  `).run(accountId, folderId, uid, filename, part.type, part.length || 0, part.partID)
-                }
-              }
-            }
-          })
         })
-
-        fetcher.once('error', (err: Error) => {
-          log.error('[syncEmails] IMAP fetch error:', err)
-          imap.closeBox(true, () => {})
-          reject(err)
-        })
-
-        fetcher.once('end', () => {
-          saveDatabase()
-          imap.closeBox(true, () => {})
-          log.info(`[syncEmails] Synced ${count}/${uids.length} emails for folder "${folder.name}"`)
-          resolve(count)
-        })
+        fetcher.once('error', reject)
+        fetcher.once('end', async () => { saveDatabase(); resolve(count) })
       })
     })
   })
 }
 
-function decodeSubject(str: string): string {
-  try {
-    const quotedPrintable = str.replace(/=\?([^\?]+)\?([BQ])\?([^\?]*)\?=/gi, (_, charset, encoding, text) => {
-      try {
-        if (encoding === 'B') {
-          return Buffer.from(text, 'base64').toString(charset)
-        } else if (encoding === 'Q') {
-          return iconv.decode(Buffer.from(text.replace(/_/g, ' ')), charset)
-        }
-        return text
-      } catch {
-        return text
-      }
-    })
-
-    const reEncoded = /=\?([^\?]+)\?([BQ])\?([^\?]*)\?=/gi
-    let match
-    let result = quotedPrintable
-    while ((match = reEncoded.exec(quotedPrintable)) !== null) {
-      try {
-        const [full, charset, encoding, encoded] = match
-        if (encoding === 'B') {
-          const decoded = Buffer.from(encoded, 'base64').toString()
-          result = result.replace(full, decoded)
-        }
-      } catch {
-        // Keep original if decode fails
-      }
-    }
-
-    return result || str
-  } catch {
-    return str
-  }
-}
-
-function extractSnippet(buffer: string, maxLength: number = 150): string {
-  try {
-    let text = buffer
-    text = text.replace(/=\r?\n/g, '')
-    text = text.replace(/=([0-9A-Fa-f]{2})/g, (_, hex) =>
-      String.fromCharCode(parseInt(hex, 16))
-    )
-    text = text.replace(/<[^>]+>/g, ' ')
-    text = text.replace(/\s+/g, ' ').trim()
-    return text.substring(0, maxLength)
-  } catch {
-    return ''
-  }
-}
-
-function extractName(fromStr: string): string {
-  const match = fromStr.match(/"([^"]+)"/)
-  return match ? match[1] : fromStr.split('<')[0].trim().replace(/"/g, '')
-}
-
-function extractPriority(header: any): string {
-  const xPriority = header['x-priority']?.[0]
-  const priority = header.priority?.[0]
-
-  if (xPriority === '1' || xPriority === '2' || priority === 'high') return 'high'
-  if (xPriority === '5' || priority === 'low') return 'low'
-  return 'normal'
-}
-
 export async function fetchEmailBody(imap: Imap, accountId: number, uid: number, folderPath: string): Promise<{ textHtml: string; textPlain: string }> {
+  imapDebug('body:fetch:start', { accountId, uid, folderPath })
+  const db = getDb()
   return new Promise((resolve) => {
-    const mailboxPath = folderPath === 'INBOX' ? 'INBOX' : folderPath
-
-    // Open the mailbox first so UID FETCH works
-    imap.openBox(mailboxPath, false, (openErr: Error | null) => {
-      if (openErr) {
-        log.error('[fetchEmailBody] openBox failed:', openErr.message)
-        resolve({ textHtml: '', textPlain: '' })
+    imap.openBox(folderPath === 'INBOX' ? 'INBOX' : folderPath, false, (openErr: Error | null) => {
+      if (openErr) return resolve({ textHtml: '', textPlain: '' })
+      const cached = db.prepare('SELECT * FROM email_bodies WHERE email_id=(SELECT id FROM emails WHERE account_id=? AND folder_id=(SELECT id FROM folders WHERE path=? LIMIT 1) AND uid=? LIMIT 1)').get(accountId, folderPath, uid) as any
+      if (cached?.text_plain || cached?.text_html) {
+        resolve({ textHtml: cached.text_html || '', textPlain: cached.text_plain || '' })
         return
       }
-
-      const fetcher = imap.fetch(uid, { bodies: '' })
-      let resolved = false
-
-      fetcher.on('message', (msg: any) => {
-        msg.on('body', (stream: any) => {
-          let buffer = ''
-          stream.on('data', (chunk: Buffer) => { buffer += chunk.toString('utf8') })
-          stream.once('end', async () => {
-            if (resolved) return
-            resolved = true
-            try {
-              const parsed = await simpleParser(buffer)
-              resolve({ textHtml: parsed.html as string || '', textPlain: parsed.text as string || '' })
-            } catch {
-              resolve({ textHtml: '', textPlain: '' })
+      const fetcher = imap.fetch(uid, { bodies: '', struct: true })
+      collectBuffer(fetcher as any)
+        .then(async (raw) => {
+          try {
+            const parsed = await simpleParser(raw)
+            const { textPlain, textHtml } = pickReadableText(parsed, raw.toString('binary'))
+            const email = db.prepare('SELECT id FROM emails WHERE account_id=? AND folder_id=(SELECT id FROM folders WHERE path=? LIMIT 1) AND uid=? LIMIT 1').get(accountId, folderPath, uid) as any
+            if (email?.id) {
+              db.prepare('INSERT OR REPLACE INTO email_bodies (email_id, text_html, text_plain) VALUES (?, ?, ?)').run(email.id, textHtml, textPlain)
             }
-          })
+            resolve({ textHtml, textPlain })
+          } catch {
+            resolve({ textHtml: '', textPlain: '' })
+          }
         })
-      })
-
-      fetcher.once('error', () => { if (!resolved) { resolved = true; resolve({ textHtml: '', textPlain: '' }) } })
-      fetcher.once('end', () => { if (!resolved) { resolved = true; resolve({ textHtml: '', textPlain: '' }) } })
+        .catch(() => resolve({ textHtml: '', textPlain: '' }))
     })
   })
 }
 
 export async function getUnreadCount(accountId: number): Promise<number> {
   const db = getDb()
-  const result = db.prepare(`
-    SELECT COUNT(*) as c FROM emails WHERE account_id=? AND is_read=0
-  `).get(accountId) as any
+  const result = db.prepare(`SELECT COUNT(*) as c FROM emails WHERE account_id=? AND is_read=0`).get(accountId) as any
   return result?.c || 0
 }
